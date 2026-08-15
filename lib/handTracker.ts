@@ -27,19 +27,24 @@ const PINKY_PIP = 18;
 const PINKY_DIP = 19;
 const PINKY_TIP = 20;
 
-// Explicit "grab" gesture: at least 3 fingers must be clearly curled.
-// Hysteresis prevents accidental grab/release flicker.
-const GRAB_ON_CURL_RATIO = 0.78;
-const GRAB_OFF_CURL_RATIO = 0.88;
+// A grab must be deliberate. We combine finger curvature and proximity to the
+// palm, then require several consecutive frames before grabbing/releasing.
+const GRAB_ON_CURL_RATIO = 0.82;
+const GRAB_OFF_CURL_RATIO = 0.90;
+const GRAB_ON_PALM_RATIO = 1.28;
+const GRAB_OFF_PALM_RATIO = 1.48;
 const GRAB_ON_FINGERS = 3;
 const GRAB_HOLD_FINGERS = 2;
+const CLOSE_FRAMES_TO_GRAB = 4;
+const OPEN_FRAMES_TO_RELEASE = 4;
 
-// Direct orb response. Hand movement is intentionally obvious, but frame deltas
-// are capped so a tracking jump cannot fling the orb across the scene.
-const ROTATE_SPEED = 7.5;
-const SMOOTHING = 0.58;
-const MAX_FRAME_DELTA = 0.06;
-const MOVE_DEADZONE = 0.001;
+// Motion filtering. The orb should clearly follow the fist without copying
+// tiny camera/landmark tremors.
+const ROTATE_SPEED = 8.0;
+const CENTER_SMOOTHING = 0.42;
+const VELOCITY_SMOOTHING = 0.48;
+const MAX_FRAME_DELTA = 0.05;
+const MOVE_DEADZONE = 0.0016;
 
 const HAND_CONNECTIONS: Array<[number, number]> = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -57,7 +62,7 @@ const FINGERS: Array<[number, number, number, number]> = [
   [PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP],
 ];
 
-export type GestureMode = "idle" | "grab";
+export type GestureMode = "idle" | "arming" | "grab";
 export type TrackerPhase =
   | "requesting-camera"
   | "camera-ready"
@@ -68,6 +73,7 @@ export interface TrackerStatus {
   hands: number;
   grips: number;
   mode: GestureMode;
+  grabProgress: number;
 }
 
 export interface HandTrackerCallbacks {
@@ -83,7 +89,10 @@ interface Point {
 
 interface HandState {
   gripping: boolean;
+  closeFrames: number;
+  openFrames: number;
   grab: Point;
+  velocity: Point;
 }
 
 function isIOSDevice(): boolean {
@@ -129,41 +138,68 @@ function palmCenter(lm: NormalizedLandmark[]): Point {
   let x = 0;
   let y = 0;
   for (const id of ids) {
-    x += 1 - lm[id].x; // mirrored to match the preview
+    x += 1 - lm[id].x;
     y += lm[id].y;
   }
   return { x: x / ids.length, y: y / ids.length };
+}
+
+function palmScale(lm: NormalizedLandmark[]): number {
+  const vertical = dist3d(lm[WRIST], lm[MIDDLE_MCP]);
+  const horizontal = dist3d(lm[INDEX_MCP], lm[PINKY_MCP]);
+  return Math.max(1e-6, (vertical + horizontal) / 2);
 }
 
 function fingerCurlRatio(
   lm: NormalizedLandmark[],
   [mcp, pip, dip, tip]: [number, number, number, number],
 ): number {
-  const direct = dist2d(lm[mcp], lm[tip]);
+  const direct = dist3d(lm[mcp], lm[tip]);
   const path =
-    dist2d(lm[mcp], lm[pip]) +
-    dist2d(lm[pip], lm[dip]) +
-    dist2d(lm[dip], lm[tip]);
+    dist3d(lm[mcp], lm[pip]) +
+    dist3d(lm[pip], lm[dip]) +
+    dist3d(lm[dip], lm[tip]);
   return path > 1e-6 ? direct / path : 1;
+}
+
+function fingerPalmRatio(
+  lm: NormalizedLandmark[],
+  finger: [number, number, number, number],
+): number {
+  const tip = finger[3];
+  return dist3d(lm[tip], lm[MIDDLE_MCP]) / palmScale(lm);
 }
 
 function curledFingerCount(
   lm: NormalizedLandmark[],
-  threshold: number,
+  curlThreshold: number,
+  palmThreshold: number,
 ): number {
   let count = 0;
   for (const finger of FINGERS) {
-    if (fingerCurlRatio(lm, finger) < threshold) count += 1;
+    const curledByShape = fingerCurlRatio(lm, finger) < curlThreshold;
+    const curledTowardPalm = fingerPalmRatio(lm, finger) < palmThreshold;
+    if (curledByShape || curledTowardPalm) count += 1;
   }
   return count;
 }
 
 function shouldStartGrab(lm: NormalizedLandmark[]): boolean {
-  return curledFingerCount(lm, GRAB_ON_CURL_RATIO) >= GRAB_ON_FINGERS;
+  return (
+    curledFingerCount(lm, GRAB_ON_CURL_RATIO, GRAB_ON_PALM_RATIO) >=
+    GRAB_ON_FINGERS
+  );
 }
 
 function shouldKeepGrab(lm: NormalizedLandmark[]): boolean {
-  return curledFingerCount(lm, GRAB_OFF_CURL_RATIO) >= GRAB_HOLD_FINGERS;
+  return (
+    curledFingerCount(lm, GRAB_OFF_CURL_RATIO, GRAB_OFF_PALM_RATIO) >=
+    GRAB_HOLD_FINGERS
+  );
+}
+
+function clampDelta(value: number): number {
+  return Math.max(-MAX_FRAME_DELTA, Math.min(MAX_FRAME_DELTA, value));
 }
 
 export class HandTracker {
@@ -179,7 +215,12 @@ export class HandTracker {
   private handStates = new Map<string, HandState>();
   private prevMode: GestureMode = "idle";
   private prevGrab: Point | null = null;
-  private lastStatus: TrackerStatus = { hands: 0, grips: 0, mode: "idle" };
+  private lastStatus: TrackerStatus = {
+    hands: 0,
+    grips: 0,
+    mode: "idle",
+    grabProgress: 0,
+  };
 
   constructor(
     video: HTMLVideoElement,
@@ -204,6 +245,7 @@ export class HandTracker {
         facingMode: { ideal: "user" },
         width: { ideal: mobile ? 480 : 640 },
         height: { ideal: mobile ? 360 : 480 },
+        frameRate: { ideal: 30, max: 30 },
       },
       audio: false,
     });
@@ -277,7 +319,7 @@ export class HandTracker {
     this.lastVideoTime = -1;
     const ctx = this.overlay.getContext("2d");
     ctx?.clearRect(0, 0, this.overlay.width, this.overlay.height);
-    this.emitStatus({ hands: 0, grips: 0, mode: "idle" });
+    this.emitStatus({ hands: 0, grips: 0, mode: "idle", grabProgress: 0 });
   }
 
   private loop = () => {
@@ -293,11 +335,11 @@ export class HandTracker {
         this.video,
         performance.now(),
       );
-      this.processHands(
-        result.landmarks,
-        result.handedness.map((h) => h[0]?.categoryName ?? "?"),
+      const labels = result.handedness.map(
+        (h) => h[0]?.categoryName ?? "?",
       );
-      this.drawOverlay(result.landmarks);
+      this.processHands(result.landmarks, labels);
+      this.drawOverlay(result.landmarks, labels);
     } catch {
       // Ignore an isolated bad frame; keep tracking alive.
     }
@@ -309,6 +351,7 @@ export class HandTracker {
   ): void {
     const activeGrabs: Point[] = [];
     const seen = new Set<string>();
+    let bestProgress = 0;
 
     landmarks.forEach((lm, i) => {
       const label = labels[i] ?? String(i);
@@ -317,18 +360,59 @@ export class HandTracker {
 
       let state = this.handStates.get(label);
       if (!state) {
-        state = { gripping: false, grab: raw };
+        state = {
+          gripping: false,
+          closeFrames: 0,
+          openFrames: 0,
+          grab: raw,
+          velocity: { x: 0, y: 0 },
+        };
         this.handStates.set(label, state);
       }
 
-      state.gripping = state.gripping
-        ? shouldKeepGrab(lm)
-        : shouldStartGrab(lm);
+      if (!state.gripping) {
+        if (shouldStartGrab(lm)) {
+          state.closeFrames = Math.min(
+            CLOSE_FRAMES_TO_GRAB,
+            state.closeFrames + 1,
+          );
+        } else {
+          state.closeFrames = 0;
+        }
+        state.openFrames = 0;
+
+        if (state.closeFrames >= CLOSE_FRAMES_TO_GRAB) {
+          state.gripping = true;
+          state.openFrames = 0;
+          state.velocity = { x: 0, y: 0 };
+        }
+      } else {
+        if (shouldKeepGrab(lm)) {
+          state.openFrames = 0;
+        } else {
+          state.openFrames = Math.min(
+            OPEN_FRAMES_TO_RELEASE,
+            state.openFrames + 1,
+          );
+        }
+
+        if (state.openFrames >= OPEN_FRAMES_TO_RELEASE) {
+          state.gripping = false;
+          state.closeFrames = 0;
+          state.openFrames = 0;
+          state.velocity = { x: 0, y: 0 };
+        }
+      }
 
       state.grab = {
-        x: state.grab.x + (raw.x - state.grab.x) * SMOOTHING,
-        y: state.grab.y + (raw.y - state.grab.y) * SMOOTHING,
+        x: state.grab.x + (raw.x - state.grab.x) * CENTER_SMOOTHING,
+        y: state.grab.y + (raw.y - state.grab.y) * CENTER_SMOOTHING,
       };
+
+      bestProgress = Math.max(
+        bestProgress,
+        state.gripping ? 1 : state.closeFrames / CLOSE_FRAMES_TO_GRAB,
+      );
 
       if (state.gripping) activeGrabs.push(state.grab);
     });
@@ -337,9 +421,9 @@ export class HandTracker {
       if (!seen.has(key)) this.handStates.delete(key);
     }
 
-    // One closed fist has one meaning: the orb is grabbed.
-    // Two simultaneous fists are deliberately ignored to avoid ambiguity.
-    const mode: GestureMode = activeGrabs.length === 1 ? "grab" : "idle";
+    let mode: GestureMode = "idle";
+    if (activeGrabs.length === 1) mode = "grab";
+    else if (activeGrabs.length === 0 && bestProgress > 0) mode = "arming";
 
     if (mode !== this.prevMode) {
       this.prevGrab = null;
@@ -348,50 +432,79 @@ export class HandTracker {
 
     if (mode === "grab") {
       const grab = activeGrabs[0];
-      if (this.prevGrab) {
-        const dx = Math.max(
-          -MAX_FRAME_DELTA,
-          Math.min(MAX_FRAME_DELTA, grab.x - this.prevGrab.x),
-        );
-        const dy = Math.max(
-          -MAX_FRAME_DELTA,
-          Math.min(MAX_FRAME_DELTA, grab.y - this.prevGrab.y),
-        );
+      const activeState = [...this.handStates.values()].find((s) => s.gripping);
 
-        if (Math.abs(dx) > MOVE_DEADZONE || Math.abs(dy) > MOVE_DEADZONE) {
+      if (this.prevGrab && activeState) {
+        const rawDx = clampDelta(grab.x - this.prevGrab.x);
+        const rawDy = clampDelta(grab.y - this.prevGrab.y);
+
+        activeState.velocity.x +=
+          (rawDx - activeState.velocity.x) * VELOCITY_SMOOTHING;
+        activeState.velocity.y +=
+          (rawDy - activeState.velocity.y) * VELOCITY_SMOOTHING;
+
+        const dx =
+          Math.abs(activeState.velocity.x) > MOVE_DEADZONE
+            ? activeState.velocity.x
+            : 0;
+        const dy =
+          Math.abs(activeState.velocity.y) > MOVE_DEADZONE
+            ? activeState.velocity.y
+            : 0;
+
+        if (dx !== 0 || dy !== 0) {
           this.callbacks.onRotate(dx * ROTATE_SPEED, dy * ROTATE_SPEED);
         }
       }
       this.prevGrab = grab;
+    } else {
+      this.prevGrab = null;
     }
 
-    this.emitStatus({ hands: landmarks.length, grips: activeGrabs.length, mode });
+    this.emitStatus({
+      hands: landmarks.length,
+      grips: activeGrabs.length,
+      mode,
+      grabProgress: mode === "grab" ? 1 : bestProgress,
+    });
   }
 
   private emitStatus(status: TrackerStatus): void {
     if (
       status.hands !== this.lastStatus.hands ||
       status.grips !== this.lastStatus.grips ||
-      status.mode !== this.lastStatus.mode
+      status.mode !== this.lastStatus.mode ||
+      Math.abs(status.grabProgress - this.lastStatus.grabProgress) > 0.01
     ) {
       this.lastStatus = status;
       this.callbacks.onStatus(status);
     }
   }
 
-  private drawOverlay(landmarks: NormalizedLandmark[][]): void {
+  private drawOverlay(
+    landmarks: NormalizedLandmark[][],
+    labels: string[],
+  ): void {
     const ctx = this.overlay.getContext("2d");
     if (!ctx) return;
     const { width, height } = this.overlay;
     ctx.clearRect(0, 0, width, height);
 
-    for (const lm of landmarks) {
-      const gripping = shouldStartGrab(lm);
+    landmarks.forEach((lm, i) => {
+      const label = labels[i] ?? String(i);
+      const state = this.handStates.get(label);
+      const gripping = state?.gripping ?? false;
+      const progress = gripping
+        ? 1
+        : Math.min(1, (state?.closeFrames ?? 0) / CLOSE_FRAMES_TO_GRAB);
+      const arming = !gripping && progress > 0;
 
       ctx.strokeStyle = gripping
-        ? "rgba(255,240,179,0.98)"
-        : "rgba(255,170,48,0.58)";
-      ctx.lineWidth = gripping ? 2.5 : 1;
+        ? "rgba(255,255,255,0.98)"
+        : arming
+          ? "rgba(255,220,120,0.95)"
+          : "rgba(255,170,48,0.58)";
+      ctx.lineWidth = gripping ? 2.7 : arming ? 2 : 1;
 
       for (const [a, b] of HAND_CONNECTIONS) {
         const pa = lm[a];
@@ -402,29 +515,56 @@ export class HandTracker {
         ctx.stroke();
       }
 
-      for (let i = 0; i < lm.length; i++) {
-        const p = lm[i];
+      for (const p of lm) {
         const x = (1 - p.x) * width;
         const y = p.y * height;
         ctx.fillStyle = gripping
-          ? "#fff0b3"
-          : "rgba(255,190,85,0.82)";
+          ? "#ffffff"
+          : arming
+            ? "#ffdc78"
+            : "rgba(255,190,85,0.82)";
         ctx.beginPath();
-        ctx.arc(x, y, gripping ? 3.2 : 2, 0, Math.PI * 2);
+        ctx.arc(x, y, gripping ? 3.2 : arming ? 2.6 : 2, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      // Palm marker = the point actually used to drive the orb.
       const palm = palmCenter(lm);
-      ctx.strokeStyle = gripping ? "#ffffff" : "rgba(255,204,102,0.7)";
-      ctx.lineWidth = gripping ? 2.5 : 1.5;
+      const px = palm.x * width;
+      const py = palm.y * height;
+      const radius = gripping ? 12 : 6 + progress * 5;
+
+      ctx.strokeStyle = gripping
+        ? "#ffffff"
+        : arming
+          ? "#ffdc78"
+          : "rgba(255,204,102,0.7)";
+      ctx.lineWidth = gripping ? 3 : arming ? 2.2 : 1.5;
       ctx.beginPath();
-      ctx.arc(palm.x * width, palm.y * height, gripping ? 9 : 6, 0, Math.PI * 2);
+      ctx.arc(px, py, radius, 0, Math.PI * 2);
       ctx.stroke();
-    }
+
+      if (arming) {
+        ctx.beginPath();
+        ctx.arc(
+          px,
+          py,
+          radius + 4,
+          -Math.PI / 2,
+          -Math.PI / 2 + Math.PI * 2 * progress,
+        );
+        ctx.stroke();
+      }
+
+      if (gripping) {
+        ctx.font = "bold 9px Courier New";
+        ctx.textAlign = "center";
+        ctx.fillStyle = "#ffffff";
+        ctx.fillText("GRAB", px, Math.max(10, py - 16));
+      }
+    });
   }
 }
 
-function dist2d(a: NormalizedLandmark, b: NormalizedLandmark): number {
-  return Math.hypot(a.x - b.x, a.y - b.y);
+function dist3d(a: NormalizedLandmark, b: NormalizedLandmark): number {
+  return Math.hypot(a.x - b.x, a.y - b.y, (a.z ?? 0) - (b.z ?? 0));
 }
