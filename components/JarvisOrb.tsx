@@ -12,7 +12,15 @@ type CameraState = "off" | "requesting" | "preview" | "on" | "error";
 
 const MODE_LABEL: Record<TrackerStatus["mode"], string> = {
   idle: "MAIN LIBRE",
+  arming: "SAISIE EN COURS",
   grab: "ORBE SAISIE",
+};
+
+const EMPTY_STATUS: TrackerStatus = {
+  hands: 0,
+  grips: 0,
+  mode: "idle",
+  grabProgress: 0,
 };
 
 function describeTrackerError(error: unknown, cameraReady: boolean): string {
@@ -43,11 +51,7 @@ export default function JarvisOrb() {
 
   const [camera, setCamera] = useState<CameraState>("off");
   const [phase, setPhase] = useState<TrackerPhase | null>(null);
-  const [status, setStatus] = useState<TrackerStatus>({
-    hands: 0,
-    grips: 0,
-    mode: "idle",
-  });
+  const [status, setStatus] = useState<TrackerStatus>(EMPTY_STATUS);
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -70,7 +74,7 @@ export default function JarvisOrb() {
     setCamera("off");
     setPhase(null);
     setError(null);
-    setStatus({ hands: 0, grips: 0, mode: "idle" });
+    setStatus(EMPTY_STATUS);
   }, []);
 
   const startGestures = useCallback(async () => {
@@ -160,6 +164,10 @@ export default function JarvisOrb() {
     if (camera === "error") return error ?? "ERREUR";
     if (status.grips > 1) return "2 POINGS DÉTECTÉS · UTILISEZ UN SEUL POING";
     if (status.mode === "grab") return "ORBE SAISIE · DÉPLACEZ LE POING";
+    if (status.mode === "arming") {
+      const percent = Math.round(status.grabProgress * 100);
+      return `SAISIE EN COURS · GARDEZ LE POING FERMÉ · ${percent}%`;
+    }
     if (status.hands > 0) {
       return `${status.hands} MAIN${status.hands > 1 ? "S" : ""} · FERMEZ LE POING POUR SAISIR`;
     }
