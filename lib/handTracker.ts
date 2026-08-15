@@ -9,22 +9,22 @@ const WASM_CDN =
 const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
-// Landmark indices (MediaPipe hand model)
 const WRIST = 0;
 const THUMB_TIP = 4;
 const INDEX_TIP = 8;
 const MIDDLE_MCP = 9;
 
-// Pinch hysteresis: thumb–index distance relative to hand size
 const PINCH_ON = 0.32;
 const PINCH_OFF = 0.45;
-
-// How strongly hand movement rotates the orb (radians per normalized unit)
 const ROTATE_SPEED = 5.0;
-// Smoothing factor for grab-point tracking (0..1, higher = snappier)
 const SMOOTHING = 0.4;
 
 export type GestureMode = "idle" | "spin" | "zoom";
+export type TrackerPhase =
+  | "requesting-camera"
+  | "camera-ready"
+  | "loading-model"
+  | "tracking";
 
 export interface TrackerStatus {
   hands: number;
@@ -32,11 +32,10 @@ export interface TrackerStatus {
 }
 
 export interface HandTrackerCallbacks {
-  /** Called when a single pinched hand drags: deltas in mirrored normalized coords. */
   onRotate(deltaTheta: number, deltaPhi: number): void;
-  /** Called when both hands pinch and spread/close: multiply camera distance by factor. */
   onZoom(factor: number): void;
   onStatus(status: TrackerStatus): void;
+  onPhase?(phase: TrackerPhase): void;
 }
 
 interface Point {
@@ -46,7 +45,45 @@ interface Point {
 
 interface HandState {
   pinching: boolean;
-  grab: Point; // smoothed pinch midpoint, mirrored
+  grab: Point;
+}
+
+function isIOSDevice(): boolean {
+  if (typeof navigator === "undefined") return false;
+  return (
+    /iPad|iPhone|iPod/.test(navigator.userAgent) ||
+    (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1)
+  );
+}
+
+function waitForMetadata(video: HTMLVideoElement): Promise<void> {
+  if (video.readyState >= 1) return Promise.resolve();
+
+  return new Promise((resolve, reject) => {
+    const timeout = window.setTimeout(() => {
+      cleanup();
+      reject(new Error("VIDEO_METADATA_TIMEOUT"));
+    }, 8000);
+
+    const onLoaded = () => {
+      cleanup();
+      resolve();
+    };
+
+    const onError = () => {
+      cleanup();
+      reject(new Error("VIDEO_METADATA_ERROR"));
+    };
+
+    const cleanup = () => {
+      window.clearTimeout(timeout);
+      video.removeEventListener("loadedmetadata", onLoaded);
+      video.removeEventListener("error", onError);
+    };
+
+    video.addEventListener("loadedmetadata", onLoaded, { once: true });
+    video.addEventListener("error", onError, { once: true });
+  });
 }
 
 export class HandTracker {
@@ -59,7 +96,6 @@ export class HandTracker {
   private running = false;
   private lastVideoTime = -1;
 
-  // keyed by handedness label so state survives re-ordering between frames
   private handStates = new Map<string, HandState>();
   private prevMode: GestureMode = "idle";
   private prevSpinGrab: Point | null = null;
@@ -77,33 +113,75 @@ export class HandTracker {
   }
 
   async start(): Promise<void> {
+    if (!navigator.mediaDevices?.getUserMedia) {
+      throw new Error("CAMERA_API_UNAVAILABLE");
+    }
+
+    this.callbacks.onPhase?.("requesting-camera");
+
+    const mobile = isIOSDevice();
     this.stream = await navigator.mediaDevices.getUserMedia({
-      video: { width: 640, height: 480, facingMode: "user" },
+      video: {
+        facingMode: { ideal: "user" },
+        width: { ideal: mobile ? 480 : 640 },
+        height: { ideal: mobile ? 360 : 480 },
+      },
       audio: false,
     });
-    this.video.srcObject = this.stream;
-    await this.video.play();
 
+    // Explicitly set all inline/autoplay flags for iPhone Safari and WKWebView.
+    this.video.muted = true;
+    this.video.autoplay = true;
+    this.video.playsInline = true;
+    this.video.setAttribute("muted", "");
+    this.video.setAttribute("autoplay", "");
+    this.video.setAttribute("playsinline", "");
+    this.video.setAttribute("webkit-playsinline", "");
+    this.video.srcObject = this.stream;
+
+    await waitForMetadata(this.video);
+    await this.video.play();
+    this.callbacks.onPhase?.("camera-ready");
+
+    this.callbacks.onPhase?.("loading-model");
     const fileset = await FilesetResolver.forVisionTasks(WASM_CDN);
-    const options = {
-      baseOptions: { modelAssetPath: MODEL_URL, delegate: "GPU" as const },
+
+    const commonOptions = {
+      baseOptions: { modelAssetPath: MODEL_URL },
       runningMode: "VIDEO" as const,
       numHands: 2,
-      minHandDetectionConfidence: 0.6,
-      minHandPresenceConfidence: 0.6,
-      minTrackingConfidence: 0.6,
+      minHandDetectionConfidence: mobile ? 0.5 : 0.6,
+      minHandPresenceConfidence: mobile ? 0.5 : 0.6,
+      minTrackingConfidence: mobile ? 0.5 : 0.6,
     };
-    try {
-      this.landmarker = await HandLandmarker.createFromOptions(fileset, options);
-    } catch {
-      // Some browsers/GPUs reject the GPU delegate — fall back to CPU
-      this.landmarker = await HandLandmarker.createFromOptions(fileset, {
-        ...options,
-        baseOptions: { ...options.baseOptions, delegate: "CPU" as const },
-      });
+
+    // iPhone WebKit is generally more reliable with CPU for this task.
+    const delegates: Array<"CPU" | "GPU"> = mobile
+      ? ["CPU", "GPU"]
+      : ["GPU", "CPU"];
+
+    let lastError: unknown = null;
+    for (const delegate of delegates) {
+      try {
+        this.landmarker = await HandLandmarker.createFromOptions(fileset, {
+          ...commonOptions,
+          baseOptions: { ...commonOptions.baseOptions, delegate },
+        });
+        lastError = null;
+        break;
+      } catch (error) {
+        lastError = error;
+      }
+    }
+
+    if (!this.landmarker) {
+      throw lastError instanceof Error
+        ? lastError
+        : new Error("MEDIAPIPE_INIT_FAILED");
     }
 
     this.running = true;
+    this.callbacks.onPhase?.("tracking");
     this.loop();
   }
 
@@ -114,11 +192,13 @@ export class HandTracker {
     this.landmarker = null;
     this.stream?.getTracks().forEach((t) => t.stop());
     this.stream = null;
+    this.video.pause();
     this.video.srcObject = null;
     this.handStates.clear();
     this.prevMode = "idle";
     this.prevSpinGrab = null;
     this.prevZoomDist = null;
+    this.lastVideoTime = -1;
     const ctx = this.overlay.getContext("2d");
     ctx?.clearRect(0, 0, this.overlay.width, this.overlay.height);
     this.emitStatus({ hands: 0, mode: "idle" });
@@ -132,9 +212,19 @@ export class HandTracker {
     if (this.video.currentTime === this.lastVideoTime) return;
     this.lastVideoTime = this.video.currentTime;
 
-    const result = this.landmarker.detectForVideo(this.video, performance.now());
-    this.processHands(result.landmarks, result.handedness.map((h) => h[0]?.categoryName ?? "?"));
-    this.drawOverlay(result.landmarks);
+    try {
+      const result = this.landmarker.detectForVideo(
+        this.video,
+        performance.now(),
+      );
+      this.processHands(
+        result.landmarks,
+        result.handedness.map((h) => h[0]?.categoryName ?? "?"),
+      );
+      this.drawOverlay(result.landmarks);
+    } catch {
+      // A single bad frame should not kill tracking on mobile Safari.
+    }
   };
 
   private processHands(
@@ -145,14 +235,13 @@ export class HandTracker {
     const seen = new Set<string>();
 
     landmarks.forEach((lm, i) => {
-      const label = labels[i];
+      const label = labels[i] ?? String(i);
       seen.add(label);
 
       const handScale = dist2d(lm[WRIST], lm[MIDDLE_MCP]);
       if (handScale < 1e-6) return;
       const pinchRatio = dist2d(lm[THUMB_TIP], lm[INDEX_TIP]) / handScale;
 
-      // Mirrored so hand-right = screen-right from the user's perspective
       const raw: Point = {
         x: 1 - (lm[THUMB_TIP].x + lm[INDEX_TIP].x) / 2,
         y: (lm[THUMB_TIP].y + lm[INDEX_TIP].y) / 2,
@@ -164,7 +253,6 @@ export class HandTracker {
         this.handStates.set(label, state);
       }
 
-      // Hysteresis so the pinch doesn't flicker on/off at the threshold
       if (state.pinching && pinchRatio > PINCH_OFF) state.pinching = false;
       else if (!state.pinching && pinchRatio < PINCH_ON) state.pinching = true;
 
@@ -176,15 +264,17 @@ export class HandTracker {
       if (state.pinching) pinchedGrabs.push(state.grab);
     });
 
-    // Drop state for hands that left the frame
     for (const key of this.handStates.keys()) {
       if (!seen.has(key)) this.handStates.delete(key);
     }
 
     const mode: GestureMode =
-      pinchedGrabs.length >= 2 ? "zoom" : pinchedGrabs.length === 1 ? "spin" : "idle";
+      pinchedGrabs.length >= 2
+        ? "zoom"
+        : pinchedGrabs.length === 1
+          ? "spin"
+          : "idle";
 
-    // Reset reference points on any mode change to avoid jumps
     if (mode !== this.prevMode) {
       this.prevSpinGrab = null;
       this.prevZoomDist = null;
@@ -207,7 +297,6 @@ export class HandTracker {
         pinchedGrabs[0].y - pinchedGrabs[1].y,
       );
       if (this.prevZoomDist && d > 1e-4) {
-        // Spread hands apart -> factor < 1 -> camera moves closer
         const factor = Math.min(1.18, Math.max(0.85, this.prevZoomDist / d));
         this.callbacks.onZoom(factor);
       }
@@ -236,7 +325,6 @@ export class HandTracker {
     for (const lm of landmarks) {
       const thumb = lm[THUMB_TIP];
       const index = lm[INDEX_TIP];
-      // Overlay canvas sits on the mirrored video preview, so mirror x here too
       const tx = (1 - thumb.x) * width;
       const ty = thumb.y * height;
       const ix = (1 - index.x) * width;
