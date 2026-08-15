@@ -11,28 +11,19 @@ import {
 type CameraState = "off" | "requesting" | "preview" | "on" | "error";
 
 const MODE_LABEL: Record<TrackerStatus["mode"], string> = {
-  idle: "VEILLE",
-  spin: "ROTATION",
-  zoom: "ZOOM",
+  idle: "MAIN LIBRE",
+  grab: "ORBE SAISIE",
 };
 
 function describeTrackerError(error: unknown, cameraReady: boolean): string {
   if (error instanceof DOMException) {
-    if (error.name === "NotAllowedError") {
-      return "ACCÈS CAMÉRA REFUSÉ";
-    }
-    if (error.name === "NotFoundError") {
-      return "AUCUNE CAMÉRA DÉTECTÉE";
-    }
-    if (error.name === "NotReadableError") {
-      return "CAMÉRA DÉJÀ UTILISÉE";
-    }
+    if (error.name === "NotAllowedError") return "ACCÈS CAMÉRA REFUSÉ";
+    if (error.name === "NotFoundError") return "AUCUNE CAMÉRA DÉTECTÉE";
+    if (error.name === "NotReadableError") return "CAMÉRA DÉJÀ UTILISÉE";
   }
 
   const message = error instanceof Error ? error.message : String(error);
-  if (message.includes("CAMERA_API_UNAVAILABLE")) {
-    return "API CAMÉRA INDISPONIBLE";
-  }
+  if (message.includes("CAMERA_API_UNAVAILABLE")) return "API CAMÉRA INDISPONIBLE";
   if (message.includes("VIDEO_METADATA")) {
     return "FLUX CAMÉRA OUVERT MAIS VIDÉO INDISPONIBLE";
   }
@@ -52,7 +43,11 @@ export default function JarvisOrb() {
 
   const [camera, setCamera] = useState<CameraState>("off");
   const [phase, setPhase] = useState<TrackerPhase | null>(null);
-  const [status, setStatus] = useState<TrackerStatus>({ hands: 0, mode: "idle" });
+  const [status, setStatus] = useState<TrackerStatus>({
+    hands: 0,
+    grips: 0,
+    mode: "idle",
+  });
   const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
@@ -75,7 +70,7 @@ export default function JarvisOrb() {
     setCamera("off");
     setPhase(null);
     setError(null);
-    setStatus({ hands: 0, mode: "idle" });
+    setStatus({ hands: 0, grips: 0, mode: "idle" });
   }, []);
 
   const startGestures = useCallback(async () => {
@@ -89,8 +84,8 @@ export default function JarvisOrb() {
     setError(null);
 
     const tracker = new HandTracker(video, overlay, {
-      onRotate: (dt, dp) => sceneRef.current?.rotateBy(dt, dp),
-      onZoom: (factor) => sceneRef.current?.zoomBy(factor),
+      onRotate: (horizontal, vertical) =>
+        sceneRef.current?.rotateBy(horizontal, vertical),
       onStatus: setStatus,
       onPhase: (nextPhase) => {
         setPhase(nextPhase);
@@ -111,9 +106,6 @@ export default function JarvisOrb() {
       const hasCamera = cameraReadyRef.current;
       setCamera("error");
       setError(describeTrackerError(err, hasCamera));
-
-      // If camera itself failed there is nothing useful to keep alive.
-      // If only MediaPipe failed, keep the live camera visible for diagnosis.
       if (!hasCamera) {
         trackerRef.current = null;
         tracker.stop();
@@ -161,13 +153,17 @@ export default function JarvisOrb() {
 
   const cameraLabel = (() => {
     if (camera === "requesting") return "AUTORISATION CAMÉRA…";
-    if (camera === "preview" && phase === "loading-model") return "CAMÉRA OK · CHARGEMENT MEDIAPIPE…";
+    if (camera === "preview" && phase === "loading-model") {
+      return "CAMÉRA OK · CHARGEMENT MEDIAPIPE…";
+    }
     if (camera === "preview") return "CAMÉRA OK";
     if (camera === "error") return error ?? "ERREUR";
+    if (status.grips > 1) return "2 POINGS DÉTECTÉS · UTILISEZ UN SEUL POING";
+    if (status.mode === "grab") return "ORBE SAISIE · DÉPLACEZ LE POING";
     if (status.hands > 0) {
-      return `${status.hands} MAIN${status.hands > 1 ? "S" : ""} · ${MODE_LABEL[status.mode]}`;
+      return `${status.hands} MAIN${status.hands > 1 ? "S" : ""} · FERMEZ LE POING POUR SAISIR`;
     }
-    return "CAMÉRA + MEDIAPIPE OK · MONTREZ VOS MAINS";
+    return "CAMÉRA + MEDIAPIPE OK · MONTREZ UNE MAIN";
   })();
 
   return (
@@ -182,14 +178,22 @@ export default function JarvisOrb() {
 
       <div className="hud hud-hint">
         <div>
-          <span className="key">DRAG</span> rotation&nbsp;&nbsp;
+          <span className="key">DRAG</span> rotation souris&nbsp;&nbsp;
           <span className="key">SCROLL</span> zoom
         </div>
         {cameraOn ? (
-          <div>
-            <span className="key">PINCE + BOUGE</span> rotation&nbsp;&nbsp;
-            <span className="key">2 MAINS PINCÉES</span> zoom
-          </div>
+          <>
+            <div>
+              <span className="key">MAIN OUVERTE</span> suivi uniquement
+            </div>
+            <div>
+              <span className="key">FERME LE POING</span> saisir l’orbe&nbsp;&nbsp;
+              <span className="key">BOUGE LE POING</span> faire tourner
+            </div>
+            <div>
+              <span className="key">OUVRE LA MAIN</span> relâcher
+            </div>
+          </>
         ) : (
           <div>
             <span className="key">G</span> gestes&nbsp;&nbsp;
@@ -231,7 +235,7 @@ export default function JarvisOrb() {
                 : camera === "preview"
                   ? "CHARGEMENT…"
                   : cameraOn
-                    ? "GESTES ON"
+                    ? MODE_LABEL[status.mode]
                     : "ACTIVER CAMÉRA + GESTES"}
             </button>
           )}
