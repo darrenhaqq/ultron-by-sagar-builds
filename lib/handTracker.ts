@@ -10,20 +10,36 @@ const MODEL_URL =
   "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task";
 
 const WRIST = 0;
-const THUMB_TIP = 4;
+const INDEX_MCP = 5;
+const INDEX_PIP = 6;
+const INDEX_DIP = 7;
 const INDEX_TIP = 8;
 const MIDDLE_MCP = 9;
+const MIDDLE_PIP = 10;
+const MIDDLE_DIP = 11;
+const MIDDLE_TIP = 12;
+const RING_MCP = 13;
+const RING_PIP = 14;
+const RING_DIP = 15;
+const RING_TIP = 16;
+const PINKY_MCP = 17;
+const PINKY_PIP = 18;
+const PINKY_DIP = 19;
+const PINKY_TIP = 20;
 
-// Generous thresholds: users should not need a perfectly closed pinch.
-const PINCH_ON_RATIO = 0.60;
-const PINCH_OFF_RATIO = 0.85;
-const PINCH_ON_ABS = 0.075;
-const PINCH_OFF_ABS = 0.105;
+// Explicit "grab" gesture: at least 3 fingers must be clearly curled.
+// Hysteresis prevents accidental grab/release flicker.
+const GRAB_ON_CURL_RATIO = 0.78;
+const GRAB_OFF_CURL_RATIO = 0.88;
+const GRAB_ON_FINGERS = 3;
+const GRAB_HOLD_FINGERS = 2;
 
-// Stronger response so camera/orb movement is immediately visible.
-const ROTATE_SPEED = 10.0;
-const SMOOTHING = 0.65;
-const MAX_FRAME_DELTA = 0.075;
+// Direct orb response. Hand movement is intentionally obvious, but frame deltas
+// are capped so a tracking jump cannot fling the orb across the scene.
+const ROTATE_SPEED = 7.5;
+const SMOOTHING = 0.58;
+const MAX_FRAME_DELTA = 0.06;
+const MOVE_DEADZONE = 0.001;
 
 const HAND_CONNECTIONS: Array<[number, number]> = [
   [0, 1], [1, 2], [2, 3], [3, 4],
@@ -34,7 +50,14 @@ const HAND_CONNECTIONS: Array<[number, number]> = [
   [0, 17],
 ];
 
-export type GestureMode = "idle" | "spin" | "zoom";
+const FINGERS: Array<[number, number, number, number]> = [
+  [INDEX_MCP, INDEX_PIP, INDEX_DIP, INDEX_TIP],
+  [MIDDLE_MCP, MIDDLE_PIP, MIDDLE_DIP, MIDDLE_TIP],
+  [RING_MCP, RING_PIP, RING_DIP, RING_TIP],
+  [PINKY_MCP, PINKY_PIP, PINKY_DIP, PINKY_TIP],
+];
+
+export type GestureMode = "idle" | "grab";
 export type TrackerPhase =
   | "requesting-camera"
   | "camera-ready"
@@ -43,12 +66,12 @@ export type TrackerPhase =
 
 export interface TrackerStatus {
   hands: number;
+  grips: number;
   mode: GestureMode;
 }
 
 export interface HandTrackerCallbacks {
   onRotate(deltaTheta: number, deltaPhi: number): void;
-  onZoom(factor: number): void;
   onStatus(status: TrackerStatus): void;
   onPhase?(phase: TrackerPhase): void;
 }
@@ -59,7 +82,7 @@ interface Point {
 }
 
 interface HandState {
-  pinching: boolean;
+  gripping: boolean;
   grab: Point;
 }
 
@@ -101,22 +124,46 @@ function waitForMetadata(video: HTMLVideoElement): Promise<void> {
   });
 }
 
-function pinchMetrics(lm: NormalizedLandmark[]) {
-  const handScale = dist2d(lm[WRIST], lm[MIDDLE_MCP]);
-  const distance = dist2d(lm[THUMB_TIP], lm[INDEX_TIP]);
-  const ratio = handScale > 1e-6 ? distance / handScale : Number.POSITIVE_INFINITY;
-  return { distance, ratio };
+function palmCenter(lm: NormalizedLandmark[]): Point {
+  const ids = [WRIST, INDEX_MCP, MIDDLE_MCP, RING_MCP, PINKY_MCP];
+  let x = 0;
+  let y = 0;
+  for (const id of ids) {
+    x += 1 - lm[id].x; // mirrored to match the preview
+    y += lm[id].y;
+  }
+  return { x: x / ids.length, y: y / ids.length };
 }
 
-function isPinchStarting(lm: NormalizedLandmark[]): boolean {
-  const { distance, ratio } = pinchMetrics(lm);
-  return ratio < PINCH_ON_RATIO || distance < PINCH_ON_ABS;
+function fingerCurlRatio(
+  lm: NormalizedLandmark[],
+  [mcp, pip, dip, tip]: [number, number, number, number],
+): number {
+  const direct = dist2d(lm[mcp], lm[tip]);
+  const path =
+    dist2d(lm[mcp], lm[pip]) +
+    dist2d(lm[pip], lm[dip]) +
+    dist2d(lm[dip], lm[tip]);
+  return path > 1e-6 ? direct / path : 1;
 }
 
-function isPinchStillHeld(lm: NormalizedLandmark[]): boolean {
-  const { distance, ratio } = pinchMetrics(lm);
-  // Releasing requires both measures to be clearly open. This prevents flicker.
-  return ratio < PINCH_OFF_RATIO || distance < PINCH_OFF_ABS;
+function curledFingerCount(
+  lm: NormalizedLandmark[],
+  threshold: number,
+): number {
+  let count = 0;
+  for (const finger of FINGERS) {
+    if (fingerCurlRatio(lm, finger) < threshold) count += 1;
+  }
+  return count;
+}
+
+function shouldStartGrab(lm: NormalizedLandmark[]): boolean {
+  return curledFingerCount(lm, GRAB_ON_CURL_RATIO) >= GRAB_ON_FINGERS;
+}
+
+function shouldKeepGrab(lm: NormalizedLandmark[]): boolean {
+  return curledFingerCount(lm, GRAB_OFF_CURL_RATIO) >= GRAB_HOLD_FINGERS;
 }
 
 export class HandTracker {
@@ -131,9 +178,8 @@ export class HandTracker {
 
   private handStates = new Map<string, HandState>();
   private prevMode: GestureMode = "idle";
-  private prevSpinGrab: Point | null = null;
-  private prevZoomDist: number | null = null;
-  private lastStatus: TrackerStatus = { hands: 0, mode: "idle" };
+  private prevGrab: Point | null = null;
+  private lastStatus: TrackerStatus = { hands: 0, grips: 0, mode: "idle" };
 
   constructor(
     video: HTMLVideoElement,
@@ -227,12 +273,11 @@ export class HandTracker {
     this.video.srcObject = null;
     this.handStates.clear();
     this.prevMode = "idle";
-    this.prevSpinGrab = null;
-    this.prevZoomDist = null;
+    this.prevGrab = null;
     this.lastVideoTime = -1;
     const ctx = this.overlay.getContext("2d");
     ctx?.clearRect(0, 0, this.overlay.width, this.overlay.height);
-    this.emitStatus({ hands: 0, mode: "idle" });
+    this.emitStatus({ hands: 0, grips: 0, mode: "idle" });
   }
 
   private loop = () => {
@@ -262,81 +307,71 @@ export class HandTracker {
     landmarks: NormalizedLandmark[][],
     labels: string[],
   ): void {
-    const pinchedGrabs: Point[] = [];
+    const activeGrabs: Point[] = [];
     const seen = new Set<string>();
 
     landmarks.forEach((lm, i) => {
       const label = labels[i] ?? String(i);
       seen.add(label);
-
-      const raw: Point = {
-        x: 1 - (lm[THUMB_TIP].x + lm[INDEX_TIP].x) / 2,
-        y: (lm[THUMB_TIP].y + lm[INDEX_TIP].y) / 2,
-      };
+      const raw = palmCenter(lm);
 
       let state = this.handStates.get(label);
       if (!state) {
-        state = { pinching: false, grab: raw };
+        state = { gripping: false, grab: raw };
         this.handStates.set(label, state);
       }
 
-      state.pinching = state.pinching
-        ? isPinchStillHeld(lm)
-        : isPinchStarting(lm);
+      state.gripping = state.gripping
+        ? shouldKeepGrab(lm)
+        : shouldStartGrab(lm);
 
       state.grab = {
         x: state.grab.x + (raw.x - state.grab.x) * SMOOTHING,
         y: state.grab.y + (raw.y - state.grab.y) * SMOOTHING,
       };
 
-      if (state.pinching) pinchedGrabs.push(state.grab);
+      if (state.gripping) activeGrabs.push(state.grab);
     });
 
     for (const key of this.handStates.keys()) {
       if (!seen.has(key)) this.handStates.delete(key);
     }
 
-    const mode: GestureMode =
-      pinchedGrabs.length >= 2
-        ? "zoom"
-        : pinchedGrabs.length === 1
-          ? "spin"
-          : "idle";
+    // One closed fist has one meaning: the orb is grabbed.
+    // Two simultaneous fists are deliberately ignored to avoid ambiguity.
+    const mode: GestureMode = activeGrabs.length === 1 ? "grab" : "idle";
 
     if (mode !== this.prevMode) {
-      this.prevSpinGrab = null;
-      this.prevZoomDist = null;
+      this.prevGrab = null;
       this.prevMode = mode;
     }
 
-    if (mode === "spin") {
-      const grab = pinchedGrabs[0];
-      if (this.prevSpinGrab) {
-        const dx = Math.max(-MAX_FRAME_DELTA, Math.min(MAX_FRAME_DELTA, grab.x - this.prevSpinGrab.x));
-        const dy = Math.max(-MAX_FRAME_DELTA, Math.min(MAX_FRAME_DELTA, grab.y - this.prevSpinGrab.y));
-        if (Math.abs(dx) > 0.0005 || Math.abs(dy) > 0.0005) {
+    if (mode === "grab") {
+      const grab = activeGrabs[0];
+      if (this.prevGrab) {
+        const dx = Math.max(
+          -MAX_FRAME_DELTA,
+          Math.min(MAX_FRAME_DELTA, grab.x - this.prevGrab.x),
+        );
+        const dy = Math.max(
+          -MAX_FRAME_DELTA,
+          Math.min(MAX_FRAME_DELTA, grab.y - this.prevGrab.y),
+        );
+
+        if (Math.abs(dx) > MOVE_DEADZONE || Math.abs(dy) > MOVE_DEADZONE) {
           this.callbacks.onRotate(dx * ROTATE_SPEED, dy * ROTATE_SPEED);
         }
       }
-      this.prevSpinGrab = grab;
-    } else if (mode === "zoom") {
-      const d = Math.hypot(
-        pinchedGrabs[0].x - pinchedGrabs[1].x,
-        pinchedGrabs[0].y - pinchedGrabs[1].y,
-      );
-      if (this.prevZoomDist && d > 1e-4) {
-        const factor = Math.min(1.22, Math.max(0.82, this.prevZoomDist / d));
-        this.callbacks.onZoom(factor);
-      }
-      this.prevZoomDist = d;
+      this.prevGrab = grab;
     }
 
-    this.emitStatus({ hands: landmarks.length, mode });
+    this.emitStatus({ hands: landmarks.length, grips: activeGrabs.length, mode });
   }
 
   private emitStatus(status: TrackerStatus): void {
     if (
       status.hands !== this.lastStatus.hands ||
+      status.grips !== this.lastStatus.grips ||
       status.mode !== this.lastStatus.mode
     ) {
       this.lastStatus = status;
@@ -351,13 +386,13 @@ export class HandTracker {
     ctx.clearRect(0, 0, width, height);
 
     for (const lm of landmarks) {
-      const pinched = isPinchStarting(lm);
+      const gripping = shouldStartGrab(lm);
 
-      // Full 21-point hand skeleton so the user can verify whole-hand tracking.
-      ctx.strokeStyle = pinched
-        ? "rgba(255,204,102,0.95)"
-        : "rgba(255,170,48,0.55)";
-      ctx.lineWidth = pinched ? 2 : 1;
+      ctx.strokeStyle = gripping
+        ? "rgba(255,240,179,0.98)"
+        : "rgba(255,170,48,0.58)";
+      ctx.lineWidth = gripping ? 2.5 : 1;
+
       for (const [a, b] of HAND_CONNECTIONS) {
         const pa = lm[a];
         const pb = lm[b];
@@ -371,25 +406,20 @@ export class HandTracker {
         const p = lm[i];
         const x = (1 - p.x) * width;
         const y = p.y * height;
-        const isControlTip = i === THUMB_TIP || i === INDEX_TIP;
-        ctx.fillStyle = isControlTip
-          ? pinched
-            ? "#fff0b3"
-            : "#ffcc66"
-          : "rgba(255,170,48,0.75)";
+        ctx.fillStyle = gripping
+          ? "#fff0b3"
+          : "rgba(255,190,85,0.82)";
         ctx.beginPath();
-        ctx.arc(x, y, isControlTip ? (pinched ? 5 : 4) : 2, 0, Math.PI * 2);
+        ctx.arc(x, y, gripping ? 3.2 : 2, 0, Math.PI * 2);
         ctx.fill();
       }
 
-      // Explicit thumb-index bridge: it becomes bright when the pinch is accepted.
-      const thumb = lm[THUMB_TIP];
-      const index = lm[INDEX_TIP];
-      ctx.strokeStyle = pinched ? "#fff0b3" : "rgba(255,170,48,0.45)";
-      ctx.lineWidth = pinched ? 3 : 1;
+      // Palm marker = the point actually used to drive the orb.
+      const palm = palmCenter(lm);
+      ctx.strokeStyle = gripping ? "#ffffff" : "rgba(255,204,102,0.7)";
+      ctx.lineWidth = gripping ? 2.5 : 1.5;
       ctx.beginPath();
-      ctx.moveTo((1 - thumb.x) * width, thumb.y * height);
-      ctx.lineTo((1 - index.x) * width, index.y * height);
+      ctx.arc(palm.x * width, palm.y * height, gripping ? 9 : 6, 0, Math.PI * 2);
       ctx.stroke();
     }
   }
