@@ -14,10 +14,25 @@ const THUMB_TIP = 4;
 const INDEX_TIP = 8;
 const MIDDLE_MCP = 9;
 
-const PINCH_ON = 0.32;
-const PINCH_OFF = 0.45;
-const ROTATE_SPEED = 5.0;
-const SMOOTHING = 0.4;
+// Generous thresholds: users should not need a perfectly closed pinch.
+const PINCH_ON_RATIO = 0.60;
+const PINCH_OFF_RATIO = 0.85;
+const PINCH_ON_ABS = 0.075;
+const PINCH_OFF_ABS = 0.105;
+
+// Stronger response so camera/orb movement is immediately visible.
+const ROTATE_SPEED = 10.0;
+const SMOOTHING = 0.65;
+const MAX_FRAME_DELTA = 0.075;
+
+const HAND_CONNECTIONS: Array<[number, number]> = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [5, 9], [9, 10], [10, 11], [11, 12],
+  [9, 13], [13, 14], [14, 15], [15, 16],
+  [13, 17], [17, 18], [18, 19], [19, 20],
+  [0, 17],
+];
 
 export type GestureMode = "idle" | "spin" | "zoom";
 export type TrackerPhase =
@@ -86,6 +101,24 @@ function waitForMetadata(video: HTMLVideoElement): Promise<void> {
   });
 }
 
+function pinchMetrics(lm: NormalizedLandmark[]) {
+  const handScale = dist2d(lm[WRIST], lm[MIDDLE_MCP]);
+  const distance = dist2d(lm[THUMB_TIP], lm[INDEX_TIP]);
+  const ratio = handScale > 1e-6 ? distance / handScale : Number.POSITIVE_INFINITY;
+  return { distance, ratio };
+}
+
+function isPinchStarting(lm: NormalizedLandmark[]): boolean {
+  const { distance, ratio } = pinchMetrics(lm);
+  return ratio < PINCH_ON_RATIO || distance < PINCH_ON_ABS;
+}
+
+function isPinchStillHeld(lm: NormalizedLandmark[]): boolean {
+  const { distance, ratio } = pinchMetrics(lm);
+  // Releasing requires both measures to be clearly open. This prevents flicker.
+  return ratio < PINCH_OFF_RATIO || distance < PINCH_OFF_ABS;
+}
+
 export class HandTracker {
   private video: HTMLVideoElement;
   private overlay: HTMLCanvasElement;
@@ -129,7 +162,6 @@ export class HandTracker {
       audio: false,
     });
 
-    // Explicitly set all inline/autoplay flags for iPhone Safari and WKWebView.
     this.video.muted = true;
     this.video.autoplay = true;
     this.video.playsInline = true;
@@ -150,12 +182,11 @@ export class HandTracker {
       baseOptions: { modelAssetPath: MODEL_URL },
       runningMode: "VIDEO" as const,
       numHands: 2,
-      minHandDetectionConfidence: mobile ? 0.5 : 0.6,
-      minHandPresenceConfidence: mobile ? 0.5 : 0.6,
-      minTrackingConfidence: mobile ? 0.5 : 0.6,
+      minHandDetectionConfidence: mobile ? 0.45 : 0.5,
+      minHandPresenceConfidence: mobile ? 0.45 : 0.5,
+      minTrackingConfidence: mobile ? 0.45 : 0.5,
     };
 
-    // iPhone WebKit is generally more reliable with CPU for this task.
     const delegates: Array<"CPU" | "GPU"> = mobile
       ? ["CPU", "GPU"]
       : ["GPU", "CPU"];
@@ -223,7 +254,7 @@ export class HandTracker {
       );
       this.drawOverlay(result.landmarks);
     } catch {
-      // A single bad frame should not kill tracking on mobile Safari.
+      // Ignore an isolated bad frame; keep tracking alive.
     }
   };
 
@@ -238,10 +269,6 @@ export class HandTracker {
       const label = labels[i] ?? String(i);
       seen.add(label);
 
-      const handScale = dist2d(lm[WRIST], lm[MIDDLE_MCP]);
-      if (handScale < 1e-6) return;
-      const pinchRatio = dist2d(lm[THUMB_TIP], lm[INDEX_TIP]) / handScale;
-
       const raw: Point = {
         x: 1 - (lm[THUMB_TIP].x + lm[INDEX_TIP].x) / 2,
         y: (lm[THUMB_TIP].y + lm[INDEX_TIP].y) / 2,
@@ -253,8 +280,9 @@ export class HandTracker {
         this.handStates.set(label, state);
       }
 
-      if (state.pinching && pinchRatio > PINCH_OFF) state.pinching = false;
-      else if (!state.pinching && pinchRatio < PINCH_ON) state.pinching = true;
+      state.pinching = state.pinching
+        ? isPinchStillHeld(lm)
+        : isPinchStarting(lm);
 
       state.grab = {
         x: state.grab.x + (raw.x - state.grab.x) * SMOOTHING,
@@ -284,9 +312,9 @@ export class HandTracker {
     if (mode === "spin") {
       const grab = pinchedGrabs[0];
       if (this.prevSpinGrab) {
-        const dx = grab.x - this.prevSpinGrab.x;
-        const dy = grab.y - this.prevSpinGrab.y;
-        if (Math.abs(dx) > 1e-4 || Math.abs(dy) > 1e-4) {
+        const dx = Math.max(-MAX_FRAME_DELTA, Math.min(MAX_FRAME_DELTA, grab.x - this.prevSpinGrab.x));
+        const dy = Math.max(-MAX_FRAME_DELTA, Math.min(MAX_FRAME_DELTA, grab.y - this.prevSpinGrab.y));
+        if (Math.abs(dx) > 0.0005 || Math.abs(dy) > 0.0005) {
           this.callbacks.onRotate(dx * ROTATE_SPEED, dy * ROTATE_SPEED);
         }
       }
@@ -297,7 +325,7 @@ export class HandTracker {
         pinchedGrabs[0].y - pinchedGrabs[1].y,
       );
       if (this.prevZoomDist && d > 1e-4) {
-        const factor = Math.min(1.18, Math.max(0.85, this.prevZoomDist / d));
+        const factor = Math.min(1.22, Math.max(0.82, this.prevZoomDist / d));
         this.callbacks.onZoom(factor);
       }
       this.prevZoomDist = d;
@@ -323,33 +351,46 @@ export class HandTracker {
     ctx.clearRect(0, 0, width, height);
 
     for (const lm of landmarks) {
-      const thumb = lm[THUMB_TIP];
-      const index = lm[INDEX_TIP];
-      const tx = (1 - thumb.x) * width;
-      const ty = thumb.y * height;
-      const ix = (1 - index.x) * width;
-      const iy = index.y * height;
+      const pinched = isPinchStarting(lm);
 
-      const handScale = dist2d(lm[WRIST], lm[MIDDLE_MCP]);
-      const pinched =
-        handScale > 1e-6 && dist2d(thumb, index) / handScale < PINCH_ON;
-
-      ctx.strokeStyle = pinched ? "#ffcc66" : "rgba(255,170,48,0.5)";
+      // Full 21-point hand skeleton so the user can verify whole-hand tracking.
+      ctx.strokeStyle = pinched
+        ? "rgba(255,204,102,0.95)"
+        : "rgba(255,170,48,0.55)";
       ctx.lineWidth = pinched ? 2 : 1;
-      ctx.beginPath();
-      ctx.moveTo(tx, ty);
-      ctx.lineTo(ix, iy);
-      ctx.stroke();
-
-      ctx.fillStyle = pinched ? "#ffcc66" : "rgba(255,170,48,0.7)";
-      for (const [x, y] of [
-        [tx, ty],
-        [ix, iy],
-      ]) {
+      for (const [a, b] of HAND_CONNECTIONS) {
+        const pa = lm[a];
+        const pb = lm[b];
         ctx.beginPath();
-        ctx.arc(x, y, pinched ? 5 : 3, 0, Math.PI * 2);
+        ctx.moveTo((1 - pa.x) * width, pa.y * height);
+        ctx.lineTo((1 - pb.x) * width, pb.y * height);
+        ctx.stroke();
+      }
+
+      for (let i = 0; i < lm.length; i++) {
+        const p = lm[i];
+        const x = (1 - p.x) * width;
+        const y = p.y * height;
+        const isControlTip = i === THUMB_TIP || i === INDEX_TIP;
+        ctx.fillStyle = isControlTip
+          ? pinched
+            ? "#fff0b3"
+            : "#ffcc66"
+          : "rgba(255,170,48,0.75)";
+        ctx.beginPath();
+        ctx.arc(x, y, isControlTip ? (pinched ? 5 : 4) : 2, 0, Math.PI * 2);
         ctx.fill();
       }
+
+      // Explicit thumb-index bridge: it becomes bright when the pinch is accepted.
+      const thumb = lm[THUMB_TIP];
+      const index = lm[INDEX_TIP];
+      ctx.strokeStyle = pinched ? "#fff0b3" : "rgba(255,170,48,0.45)";
+      ctx.lineWidth = pinched ? 3 : 1;
+      ctx.beginPath();
+      ctx.moveTo((1 - thumb.x) * width, thumb.y * height);
+      ctx.lineTo((1 - index.x) * width, index.y * height);
+      ctx.stroke();
     }
   }
 }
