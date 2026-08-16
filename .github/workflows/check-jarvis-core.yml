@@ -3,6 +3,7 @@ name: Check Jarvis Core Worker
 on:
   push:
     branches:
+      - main
       - jarvis-remote-brain
     paths:
       - "worker/**"
