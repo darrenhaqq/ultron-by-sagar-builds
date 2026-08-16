@@ -7,6 +7,11 @@
   "ai": {
     "binding": "AI"
   },
+  "d1_databases": [
+    {
+      "binding": "DB"
+    }
+  ],
   "vars": {
     "ALLOWED_ORIGIN": "https://darrenhaqq.github.io",
     "JARVIS_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast"
