@@ -1,5 +1,5 @@
-import JarvisOrb from "@/components/JarvisOrb";
+import JarvisShell from "@/components/JarvisShell";
 
 export default function Home() {
-  return <JarvisOrb />;
+  return <JarvisShell />;
 }
