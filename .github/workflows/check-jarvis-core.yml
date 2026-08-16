@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - jarvis-remote-brain
+      - jarvis-memory-v1
     paths:
       - "worker/**"
       - ".github/workflows/check-jarvis-core.yml"
