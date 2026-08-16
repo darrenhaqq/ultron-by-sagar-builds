@@ -1,0 +1,17 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "jarvis-core",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-08-16",
+  "workers_dev": true,
+  "ai": {
+    "binding": "AI"
+  },
+  "vars": {
+    "ALLOWED_ORIGIN": "https://darrenhaqq.github.io",
+    "JARVIS_MODEL": "@cf/meta/llama-3.1-8b-instruct-fast"
+  },
+  "observability": {
+    "enabled": true
+  }
+}
