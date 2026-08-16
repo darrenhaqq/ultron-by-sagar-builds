@@ -4,14 +4,20 @@ import {
   type ComponentType,
   type FormEvent,
   useCallback,
+  useRef,
   useState,
 } from "react";
+import {
+  runJarvisCore,
+  type JarvisCoreResult,
+  type WorkspaceSection,
+} from "@/lib/jarvisCore";
 
 type ImmersiveState = "idle" | "loading" | "ready" | "error";
-type WorkspaceSection = "projects" | "files" | "ideas" | "research" | null;
+type CoreState = "idle" | "running" | "done" | "error";
 
 const WORKSPACE_ITEMS: Array<{
-  id: Exclude<WorkspaceSection, null>;
+  id: WorkspaceSection;
   label: string;
   detail: string;
 }> = [
@@ -34,12 +40,16 @@ function supportsWebGL(): boolean {
 }
 
 export default function JarvisShell() {
+  const abortRef = useRef<AbortController | null>(null);
   const [Immersive, setImmersive] = useState<ComponentType | null>(null);
   const [immersiveState, setImmersiveState] = useState<ImmersiveState>("idle");
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
-  const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection>(null);
+  const [workspaceSection, setWorkspaceSection] = useState<WorkspaceSection | null>(null);
   const [command, setCommand] = useState("");
   const [lastCommand, setLastCommand] = useState<string | null>(null);
+  const [coreState, setCoreState] = useState<CoreState>("idle");
+  const [coreResult, setCoreResult] = useState<JarvisCoreResult | null>(null);
+  const [coreError, setCoreError] = useState<string | null>(null);
 
   const openImmersive = useCallback(async () => {
     if (immersiveState === "loading" || immersiveState === "ready") return;
@@ -63,16 +73,59 @@ export default function JarvisShell() {
     setImmersive(null);
   }, []);
 
+  const executeCommand = useCallback(
+    async (rawCommand: string) => {
+      const trimmed = rawCommand.trim();
+      if (!trimmed || coreState === "running") return;
+
+      abortRef.current?.abort();
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      setLastCommand(trimmed);
+      setCoreState("running");
+      setCoreError(null);
+
+      try {
+        const result = await runJarvisCore(trimmed, controller.signal);
+        if (controller.signal.aborted) return;
+        setCoreResult(result);
+        setCoreState("done");
+
+        if (result.uiAction.type === "open-workspace") {
+          setWorkspaceOpen(true);
+          setWorkspaceSection(result.uiAction.section ?? null);
+        } else if (result.uiAction.type === "open-immersive") {
+          await openImmersive();
+        }
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "AbortError") return;
+        setCoreState("error");
+        setCoreError("Le Core n’a pas pu terminer cette demande.");
+      } finally {
+        if (abortRef.current === controller) abortRef.current = null;
+      }
+    },
+    [coreState, openImmersive],
+  );
+
   const submitCommand = useCallback(
     (event: FormEvent<HTMLFormElement>) => {
       event.preventDefault();
       const trimmed = command.trim();
       if (!trimmed) return;
-      setLastCommand(trimmed);
       setCommand("");
+      void executeCommand(trimmed);
     },
-    [command],
+    [command, executeCommand],
   );
+
+  const stopCore = useCallback(() => {
+    abortRef.current?.abort();
+    abortRef.current = null;
+    setCoreState("idle");
+    setCoreError(null);
+  }, []);
 
   return (
     <main className="jarvis-shell">
@@ -80,7 +133,8 @@ export default function JarvisShell() {
         <div>
           <div className="shell-kicker">J.A.R.V.I.S.</div>
           <div className="shell-status">
-            <span className="status-dot" aria-hidden="true" /> MODE LÉGER
+            <span className="status-dot" aria-hidden="true" />
+            {coreState === "running" ? " CORE ACTIF" : " MODE LÉGER"}
           </div>
         </div>
         <button
@@ -118,8 +172,8 @@ export default function JarvisShell() {
                 </div>
                 <div className="workspace-subtitle">
                   {workspaceSection
-                    ? "Le contenu réel sera fourni par Jarvis Core."
-                    : "Sélectionne une zone. Rien de lourd n’est chargé tant que tu ne l’ouvres pas."}
+                    ? "Jarvis Core a choisi cette zone selon ton objectif."
+                    : "Sélectionne une zone, ou demande directement à Jarvis de l’ouvrir."}
                 </div>
               </div>
             </div>
@@ -128,7 +182,7 @@ export default function JarvisShell() {
               <div className="workspace-detail">
                 <div className="workspace-node workspace-node-active" aria-hidden="true" />
                 <p>
-                  Cette vue est déjà séparée du moteur 3D. Elle pourra recevoir les données du Core puis être affichée en cartes légères ou dans l’espace immersif.
+                  Cette zone est prête à recevoir ses données réelles depuis les outils du Core, sans charger la 3D ni la caméra.
                 </p>
               </div>
             ) : (
@@ -153,35 +207,64 @@ export default function JarvisShell() {
           </div>
         ) : (
           <div className="conversation-home">
-            <div className="light-orb" aria-hidden="true">
+            <div className={`light-orb${coreState === "running" ? " core-running" : ""}`} aria-hidden="true">
               <span />
             </div>
             <h1>Que dois-je faire pour toi&nbsp;?</h1>
             <p>
-              Le client léger est prêt. L’intelligence, la mémoire et les outils seront connectés au Jarvis Core sans alourdir le téléphone.
+              Donne-moi l’objectif. Le Core choisit maintenant lui-même la première action utile au lieu d’attendre une commande d’interface précise.
             </p>
 
-            {lastCommand ? (
+            {lastCommand && !coreResult && coreState !== "running" ? (
               <div className="local-command">
-                <span>COMMANDE CAPTURÉE</span>
+                <span>DERNIÈRE DEMANDE</span>
                 <strong>{lastCommand}</strong>
-                <small>Traitement IA non connecté dans cette étape.</small>
               </div>
             ) : null}
           </div>
         )}
       </section>
 
+      {coreState === "running" ? (
+        <div className="core-card core-card-running" role="status">
+          <div>
+            <span>JARVIS CORE</span>
+            <strong>Analyse de l’objectif et choix de l’action…</strong>
+          </div>
+          <button type="button" onClick={stopCore}>STOP</button>
+        </div>
+      ) : coreResult ? (
+        <div className="core-card" role="status">
+          <div className="core-card-copy">
+            <span>{coreResult.mode === "remote" ? "CORE IA" : "CORE LOCAL"}</span>
+            <strong>{coreResult.objective}</strong>
+            <small>{coreResult.answer}</small>
+          </div>
+          <div className="core-plan" aria-label="Plan Jarvis">
+            {coreResult.steps.map((step) => (
+              <span key={step.id} data-status={step.status} title={step.label}>
+                {step.status === "done" ? "✓" : step.status === "blocked" ? "!" : "·"}
+              </span>
+            ))}
+          </div>
+        </div>
+      ) : coreState === "error" ? (
+        <div className="core-card core-card-error" role="alert">
+          {coreError}
+        </div>
+      ) : null}
+
       <div className="shell-bottom">
         <form className="command-bar" onSubmit={submitCommand}>
           <input
             value={command}
             onChange={(event) => setCommand(event.target.value)}
-            placeholder="Demande quelque chose à Jarvis…"
+            placeholder="Ex. Jarvis, montre-moi mes projets…"
             aria-label="Commande Jarvis"
+            disabled={coreState === "running"}
           />
-          <button type="submit" disabled={!command.trim()}>
-            ENVOYER
+          <button type="submit" disabled={!command.trim() || coreState === "running"}>
+            {coreState === "running" ? "…" : "ENVOYER"}
           </button>
         </form>
 
