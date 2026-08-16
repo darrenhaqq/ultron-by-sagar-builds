@@ -2,13 +2,13 @@
 
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createOrbScene, type OrbSceneApi } from "@/lib/orbScene";
-import {
-  HandTracker,
-  type TrackerPhase,
-  type TrackerStatus,
-} from "@/lib/handTracker";
+import type { TrackerPhase, TrackerStatus } from "@/lib/handTracker";
 
 type CameraState = "off" | "requesting" | "preview" | "on" | "error";
+type TrackerController = {
+  start(): Promise<void>;
+  stop(): void;
+};
 
 const MODE_LABEL: Record<TrackerStatus["mode"], string> = {
   idle: "MAIN LIBRE",
@@ -46,7 +46,8 @@ export default function JarvisOrb() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const overlayRef = useRef<HTMLCanvasElement>(null);
   const sceneRef = useRef<OrbSceneApi | null>(null);
-  const trackerRef = useRef<HandTracker | null>(null);
+  const trackerRef = useRef<TrackerController | null>(null);
+  const startingRef = useRef(false);
   const cameraReadyRef = useRef(false);
 
   const [camera, setCamera] = useState<CameraState>("off");
@@ -62,6 +63,7 @@ export default function JarvisOrb() {
     return () => {
       trackerRef.current?.stop();
       trackerRef.current = null;
+      startingRef.current = false;
       scene.dispose();
       sceneRef.current = null;
     };
@@ -70,6 +72,7 @@ export default function JarvisOrb() {
   const stopGestures = useCallback(() => {
     trackerRef.current?.stop();
     trackerRef.current = null;
+    startingRef.current = false;
     cameraReadyRef.current = false;
     setCamera("off");
     setPhase(null);
@@ -80,44 +83,50 @@ export default function JarvisOrb() {
   const startGestures = useCallback(async () => {
     const video = videoRef.current;
     const overlay = overlayRef.current;
-    if (!video || !overlay || trackerRef.current) return;
+    if (!video || !overlay || trackerRef.current || startingRef.current) return;
 
+    startingRef.current = true;
     cameraReadyRef.current = false;
     setCamera("requesting");
     setPhase("requesting-camera");
     setError(null);
 
-    const tracker = new HandTracker(video, overlay, {
-      onRotate: (horizontal, vertical) =>
-        sceneRef.current?.rotateBy(horizontal, vertical),
-      onStatus: setStatus,
-      onPhase: (nextPhase) => {
-        setPhase(nextPhase);
-        if (nextPhase === "camera-ready" || nextPhase === "loading-model") {
-          cameraReadyRef.current = true;
-          setCamera("preview");
-        } else if (nextPhase === "tracking") {
-          cameraReadyRef.current = true;
-          setCamera("on");
-        }
-      },
-    });
-    trackerRef.current = tracker;
-
     try {
+      // MediaPipe is intentionally imported only here. Opening the orb does not
+      // download the hand-tracking runtime; it is paid for only when requested.
+      const { HandTracker } = await import("@/lib/handTracker");
+      const tracker = new HandTracker(video, overlay, {
+        onRotate: (horizontal, vertical) =>
+          sceneRef.current?.rotateBy(horizontal, vertical),
+        onStatus: setStatus,
+        onPhase: (nextPhase) => {
+          setPhase(nextPhase);
+          if (nextPhase === "camera-ready" || nextPhase === "loading-model") {
+            cameraReadyRef.current = true;
+            setCamera("preview");
+          } else if (nextPhase === "tracking") {
+            cameraReadyRef.current = true;
+            setCamera("on");
+          }
+        },
+      });
+      trackerRef.current = tracker;
       await tracker.start();
     } catch (err) {
       const hasCamera = cameraReadyRef.current;
       setCamera("error");
       setError(describeTrackerError(err, hasCamera));
       if (!hasCamera) {
+        trackerRef.current?.stop();
         trackerRef.current = null;
-        tracker.stop();
       }
+    } finally {
+      startingRef.current = false;
     }
   }, []);
 
   const toggleGestures = useCallback(() => {
+    if (startingRef.current) return;
     if (trackerRef.current) stopGestures();
     else void startGestures();
   }, [startGestures, stopGestures]);
