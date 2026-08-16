@@ -1,9 +1,7 @@
 import type { JarvisIdentity } from "./auth";
+import { ensureSchema, type DbEnv } from "./db";
 
-export type MemoryEnv = {
-  SUPABASE_URL?: string;
-  SUPABASE_PUBLISHABLE_KEY?: string;
-};
+export type MemoryEnv = DbEnv;
 
 export type MemoryKind =
   | "decision"
@@ -43,25 +41,15 @@ export type SaveMemoryInput = {
   content: string;
   importance?: number;
   projectId?: string | null;
+  projectName?: string | null;
 };
-
-function apiBase(env: MemoryEnv): string {
-  return `${env.SUPABASE_URL!.replace(/\/$/, "")}/rest/v1`;
-}
-
-function headers(env: MemoryEnv, identity: JarvisIdentity): HeadersInit {
-  return {
-    apikey: env.SUPABASE_PUBLISHABLE_KEY!,
-    authorization: `Bearer ${identity.accessToken}`,
-    "content-type": "application/json",
-  };
-}
 
 function normalize(text: string): string {
   return text
     .normalize("NFD")
     .replace(/[\u0300-\u036f]/g, "")
     .toLowerCase()
+    .replace(/[’']/g, " ")
     .replace(/[^a-z0-9\s-]/g, " ")
     .replace(/\s+/g, " ")
     .trim();
@@ -92,11 +80,39 @@ function relevance(commandWords: Set<string>, text: string): number {
   return hits / Math.max(1, commandWords.size);
 }
 
-async function readJson<T>(response: Response): Promise<T> {
-  if (!response.ok) {
-    throw new Error(`MEMORY_HTTP_${response.status}`);
+async function resolveProjectId(
+  projectId: string | null | undefined,
+  projectName: string | null | undefined,
+  env: MemoryEnv,
+): Promise<string | null> {
+  const db = await ensureSchema(env);
+  if (projectId) {
+    const existing = await db
+      .prepare("SELECT id FROM jarvis_projects WHERE id = ?")
+      .bind(projectId)
+      .first<{ id: string }>();
+    if (existing?.id) return existing.id;
   }
-  return (await response.json()) as T;
+
+  const cleanName = projectName?.trim();
+  if (!cleanName) return null;
+  const normalizedName = normalize(cleanName);
+  if (!normalizedName) return null;
+
+  const existing = await db
+    .prepare("SELECT id FROM jarvis_projects WHERE normalized_name = ?")
+    .bind(normalizedName)
+    .first<{ id: string }>();
+  if (existing?.id) return existing.id;
+
+  const id = crypto.randomUUID();
+  await db
+    .prepare(
+      "INSERT INTO jarvis_projects (id, name, normalized_name, status, priority) VALUES (?, ?, ?, 'active', 50)",
+    )
+    .bind(id, cleanName.slice(0, 180), normalizedName.slice(0, 180))
+    .run();
+  return id;
 }
 
 export async function retrieveMemoryContext(
@@ -104,34 +120,32 @@ export async function retrieveMemoryContext(
   identity: JarvisIdentity,
   env: MemoryEnv,
 ): Promise<MemoryContext> {
-  if (!env.SUPABASE_URL || !env.SUPABASE_PUBLISHABLE_KEY) {
-    return { projects: [], memories: [] };
-  }
-
-  const [projectsResponse, memoriesResponse] = await Promise.all([
-    fetch(
-      `${apiBase(env)}/jarvis_projects?select=id,name,summary,status,priority,updated_at&status=eq.active&order=priority.desc,updated_at.desc&limit=20`,
-      { headers: headers(env, identity) },
-    ),
-    fetch(
-      `${apiBase(env)}/jarvis_memories?select=id,project_id,kind,title,content,importance,updated_at&order=importance.desc,updated_at.desc&limit=60`,
-      { headers: headers(env, identity) },
-    ),
+  void identity;
+  const db = await ensureSchema(env);
+  const [projectsResult, memoriesResult] = await Promise.all([
+    db
+      .prepare(
+        "SELECT id, name, summary, status, priority, updated_at FROM jarvis_projects WHERE status = 'active' ORDER BY priority DESC, updated_at DESC LIMIT 20",
+      )
+      .all<ProjectItem>(),
+    db
+      .prepare(
+        "SELECT id, project_id, kind, title, content, importance, updated_at FROM jarvis_memories ORDER BY importance DESC, updated_at DESC LIMIT 60",
+      )
+      .all<MemoryItem>(),
   ]);
 
-  const [projects, memories] = await Promise.all([
-    readJson<ProjectItem[]>(projectsResponse),
-    readJson<MemoryItem[]>(memoriesResponse),
-  ]);
-
+  const projects = projectsResult.results || [];
+  const memories = memoriesResult.results || [];
   const words = keywords(command);
+
   const scoredProjects = projects
     .map((project) => ({
       project,
       score:
         relevance(words, project.name) * 2 +
         relevance(words, project.summary || "") +
-        project.priority / 100,
+        Number(project.priority) / 100,
     }))
     .sort((a, b) => b.score - a.score);
 
@@ -147,7 +161,7 @@ export async function retrieveMemoryContext(
       score:
         relevance(words, `${memory.title} ${memory.content}`) * 3 +
         (memory.project_id && selectedProjectIds.has(memory.project_id) ? 0.5 : 0) +
-        memory.importance / 100,
+        Number(memory.importance) / 100,
     }))
     .sort((a, b) => b.score - a.score);
 
@@ -164,26 +178,58 @@ export async function saveMemory(
   identity: JarvisIdentity,
   env: MemoryEnv,
 ): Promise<MemoryItem> {
+  void identity;
+  const db = await ensureSchema(env);
   const importance = Math.max(0, Math.min(100, Math.round(input.importance ?? 60)));
-  const response = await fetch(`${apiBase(env)}/jarvis_memories`, {
-    method: "POST",
-    headers: {
-      ...headers(env, identity),
-      Prefer: "return=representation",
-    },
-    body: JSON.stringify({
-      owner_id: identity.id,
-      project_id: input.projectId || null,
-      kind: input.kind,
-      title: input.title.slice(0, 180),
-      content: input.content.slice(0, 4000),
-      importance,
-    }),
-  });
+  const projectId = await resolveProjectId(input.projectId, input.projectName, env);
+  const id = crypto.randomUUID();
+  const title = input.title.trim().slice(0, 180);
+  const content = input.content.trim().slice(0, 4000);
 
-  const rows = await readJson<MemoryItem[]>(response);
-  if (!rows[0]) throw new Error("MEMORY_WRITE_EMPTY");
-  return rows[0];
+  await db
+    .prepare(
+      "INSERT INTO jarvis_memories (id, project_id, kind, title, content, importance, source) VALUES (?, ?, ?, ?, ?, ?, 'explicit')",
+    )
+    .bind(id, projectId, input.kind, title, content, importance)
+    .run();
+
+  const memory = await db
+    .prepare(
+      "SELECT id, project_id, kind, title, content, importance, updated_at FROM jarvis_memories WHERE id = ?",
+    )
+    .bind(id)
+    .first<MemoryItem>();
+
+  if (!memory) throw new Error("MEMORY_WRITE_EMPTY");
+  return memory;
+}
+
+export async function listProjects(
+  identity: JarvisIdentity,
+  env: MemoryEnv,
+): Promise<ProjectItem[]> {
+  void identity;
+  const db = await ensureSchema(env);
+  const result = await db
+    .prepare(
+      "SELECT id, name, summary, status, priority, updated_at FROM jarvis_projects ORDER BY CASE status WHEN 'active' THEN 0 WHEN 'paused' THEN 1 WHEN 'completed' THEN 2 ELSE 3 END, priority DESC, updated_at DESC LIMIT 100",
+    )
+    .all<ProjectItem>();
+  return result.results || [];
+}
+
+export async function listRecentMemories(
+  identity: JarvisIdentity,
+  env: MemoryEnv,
+): Promise<MemoryItem[]> {
+  void identity;
+  const db = await ensureSchema(env);
+  const result = await db
+    .prepare(
+      "SELECT id, project_id, kind, title, content, importance, updated_at FROM jarvis_memories ORDER BY updated_at DESC LIMIT 100",
+    )
+    .all<MemoryItem>();
+  return result.results || [];
 }
 
 export function memoryContextForPrompt(context: MemoryContext): string {
@@ -202,10 +248,7 @@ export function memoryContextForPrompt(context: MemoryContext): string {
 
   const memories = context.memories.length
     ? context.memories
-        .map(
-          (memory) =>
-            `- [${memory.kind}] ${memory.title}: ${memory.content}`,
-        )
+        .map((memory) => `- [${memory.kind}] ${memory.title}: ${memory.content}`)
         .join("\n")
     : "- Aucun souvenir pertinent";
 
