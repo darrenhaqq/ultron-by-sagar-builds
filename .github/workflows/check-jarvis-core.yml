@@ -1,0 +1,36 @@
+name: Check Jarvis Core Worker
+
+on:
+  push:
+    branches:
+      - jarvis-remote-brain
+    paths:
+      - "worker/**"
+      - ".github/workflows/check-jarvis-core.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-worker:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: worker
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: worker/package.json
+
+      - name: Install Worker dependencies
+        run: npm install --no-audit --no-fund
+
+      - name: Bundle Worker without deployment
+        run: npm run check
