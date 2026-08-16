@@ -30,7 +30,10 @@ interface RemoteCoreResponse {
   steps?: JarvisPlanStep[];
 }
 
-const REMOTE_CORE_URL = process.env.NEXT_PUBLIC_JARVIS_CORE_URL?.trim();
+const DEFAULT_REMOTE_CORE_URL =
+  "https://ultron-by-sagar-builds.recouvr-saas.workers.dev";
+const REMOTE_CORE_URL =
+  process.env.NEXT_PUBLIC_JARVIS_CORE_URL?.trim() || DEFAULT_REMOTE_CORE_URL;
 
 function normalize(input: string): string {
   return input
