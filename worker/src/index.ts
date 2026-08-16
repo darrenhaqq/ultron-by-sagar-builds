@@ -1,5 +1,15 @@
-import { authenticate, authConfigured, type AuthEnv, type JarvisIdentity } from "./auth";
 import {
+  authenticate,
+  authConfigured,
+  login,
+  logout,
+  type AuthEnv,
+  type JarvisIdentity,
+} from "./auth";
+import { dbConfigured } from "./db";
+import {
+  listProjects,
+  listRecentMemories,
   memoryContextForPrompt,
   retrieveMemoryContext,
   saveMemory,
@@ -29,6 +39,15 @@ type ModelStep = {
   status: "done" | "planned" | "blocked";
 };
 
+type ModelMemory = {
+  save: boolean;
+  kind: MemoryKind;
+  title: string;
+  content: string;
+  importance: number;
+  projectName: string;
+};
+
 type ModelDecision = {
   objective: string;
   answer: string;
@@ -36,7 +55,17 @@ type ModelDecision = {
   action: "none" | "open-workspace" | "open-immersive";
   section: WorkspaceSection | "none";
   steps: ModelStep[];
+  memory?: ModelMemory;
 };
+
+const MEMORY_KIND_VALUES = [
+  "decision",
+  "preference",
+  "fact",
+  "commitment",
+  "procedure",
+  "note",
+] as const;
 
 const OUTPUT_SCHEMA = {
   type: "object",
@@ -68,6 +97,19 @@ const OUTPUT_SCHEMA = {
         additionalProperties: false,
       },
     },
+    memory: {
+      type: "object",
+      properties: {
+        save: { type: "boolean" },
+        kind: { type: "string", enum: MEMORY_KIND_VALUES },
+        title: { type: "string" },
+        content: { type: "string" },
+        importance: { type: "number", minimum: 0, maximum: 100 },
+        projectName: { type: "string" },
+      },
+      required: ["save", "kind", "title", "content", "importance", "projectName"],
+      additionalProperties: false,
+    },
   },
   required: ["objective", "answer", "confidence", "action", "section", "steps"],
   additionalProperties: false,
@@ -90,13 +132,15 @@ Règles absolues :
 - Choisis open-immersive seulement si l'utilisateur demande explicitement l'orbe, la 3D ou la vue immersive.
 - Pour une question générale qui ne nécessite aucun outil, réponds directement et action=none.
 - N'invente jamais une action exécutée.
+- Le champ memory sert uniquement à préparer une mémoire lorsque l'utilisateur demande EXPLICITEMENT de retenir, mémoriser, se souvenir ou ne pas oublier une information.
+- Ne propose jamais memory.save=true pour une conversation ordinaire, une supposition, une donnée sensible non demandée ou une information trouvée implicitement.
+- Si une mémoire explicite concerne un projet nommé, mets uniquement le nom du projet dans memory.projectName. Sinon mets une chaîne vide.
 `;
 
 function corsHeaders(origin: string | null, env: Env): HeadersInit {
   const allowed = env.ALLOWED_ORIGIN || "https://darrenhaqq.github.io";
-  const selected = origin === allowed ? allowed : allowed;
   return {
-    "Access-Control-Allow-Origin": selected,
+    "Access-Control-Allow-Origin": allowed,
     "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
     "Access-Control-Allow-Headers": "content-type, authorization",
     "Access-Control-Max-Age": "86400",
@@ -148,7 +192,47 @@ function extractDecision(raw: unknown): ModelDecision | null {
     return null;
   }
 
+  if (value.memory && typeof value.memory === "object") {
+    const memory = value.memory as Partial<ModelMemory>;
+    const kinds = new Set<string>(MEMORY_KIND_VALUES);
+    if (
+      typeof memory.save !== "boolean" ||
+      typeof memory.kind !== "string" ||
+      !kinds.has(memory.kind) ||
+      typeof memory.title !== "string" ||
+      typeof memory.content !== "string" ||
+      typeof memory.importance !== "number" ||
+      typeof memory.projectName !== "string"
+    ) {
+      delete value.memory;
+    }
+  }
+
   return value as ModelDecision;
+}
+
+function normalize(input: string): string {
+  return input
+    .normalize("NFD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .toLowerCase()
+    .replace(/[’']/g, " ")
+    .replace(/[^a-z0-9\s-]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function explicitMemoryRequest(command: string): boolean {
+  const text = normalize(command);
+  return [
+    "retiens ",
+    "memorise ",
+    "memoriser ",
+    "garde en memoire",
+    "souviens toi",
+    "n oublie pas",
+    "rappelle toi",
+  ].some((phrase) => text.includes(phrase));
 }
 
 async function requireIdentity(
@@ -161,12 +245,12 @@ async function requireIdentity(
 }
 
 async function handleRun(request: Request, env: Env): Promise<Response> {
-  if (!authConfigured(env)) {
-    return jsonResponse({ error: "IDENTITY_NOT_CONFIGURED" }, 503, request, env);
+  let identity: JarvisIdentity | null = null;
+  if (authConfigured(env)) {
+    const auth = await authenticate(request, env);
+    if (!auth.ok) return jsonResponse({ error: auth.code }, auth.status, request, env);
+    identity = auth.identity;
   }
-
-  const identity = await requireIdentity(request, env);
-  if (identity instanceof Response) return identity;
 
   const contentLength = Number(request.headers.get("content-length") || "0");
   if (contentLength > 16_384) {
@@ -191,15 +275,20 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
   }
 
   const model = env.JARVIS_MODEL || "@cf/meta/llama-3.1-8b-instruct-fast";
-  let memoryPrompt = "La mémoire personnelle n'est pas disponible pour cette exécution.";
+  let memoryPrompt = authConfigured(env)
+    ? "La mémoire personnelle est déverrouillée, mais aucun contexte n'a encore été récupéré."
+    : "La mémoire personnelle n'est pas encore activée sur ce Jarvis.";
   let memoryLoaded = false;
 
-  try {
-    const memory = await retrieveMemoryContext(command, identity, env);
-    memoryPrompt = memoryContextForPrompt(memory);
-    memoryLoaded = true;
-  } catch (error) {
-    console.error("Jarvis memory read failure", error);
+  if (identity) {
+    try {
+      const memory = await retrieveMemoryContext(command, identity, env);
+      memoryPrompt = memoryContextForPrompt(memory);
+      memoryLoaded = true;
+    } catch (error) {
+      console.error("Jarvis memory read failure", error);
+      memoryPrompt = "La mémoire personnelle est temporairement indisponible pour cette exécution.";
+    }
   }
 
   try {
@@ -208,12 +297,12 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
         { role: "system", content: SYSTEM_PROMPT },
         {
           role: "system",
-          content: `CONTEXTE MÉMOIRE AUTORISÉ POUR CET UTILISATEUR\n${memoryPrompt}`,
+          content: `ÉTAT MÉMOIRE\n${memoryPrompt}`,
         },
         { role: "user", content: command },
       ],
       temperature: 0.2,
-      max_tokens: 700,
+      max_tokens: 760,
       response_format: {
         type: "json_schema",
         json_schema: OUTPUT_SCHEMA,
@@ -225,6 +314,39 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
       return jsonResponse({ error: "MODEL_OUTPUT_INVALID" }, 502, request, env);
     }
 
+    let memorySaved = false;
+    let memoryRequested = false;
+    const wantsMemory = explicitMemoryRequest(command);
+    if (wantsMemory) {
+      memoryRequested = true;
+      if (identity) {
+        try {
+          const candidate = decision.memory;
+          await saveMemory(
+            {
+              kind: candidate?.kind || "note",
+              title: (candidate?.title || "Information à retenir").trim(),
+              content: (candidate?.content || command).trim(),
+              importance: candidate?.importance ?? 70,
+              projectName: candidate?.projectName?.trim() || null,
+            },
+            identity,
+            env,
+          );
+          memorySaved = true;
+        } catch (error) {
+          console.error("Jarvis automatic memory write failure", error);
+        }
+      }
+    }
+
+    let answer = decision.answer;
+    if (wantsMemory && !identity) {
+      answer = `${answer} La mémoire personnelle doit d’abord être déverrouillée pour que je puisse conserver cette information.`;
+    } else if (wantsMemory && identity && !memorySaved) {
+      answer = `${answer} Je n’ai pas pu enregistrer cette information dans la mémoire durable.`;
+    }
+
     const steps = decision.steps.slice(0, 6).map((step, index) => ({
       id: `step-${index + 1}`,
       label: step.label,
@@ -234,7 +356,7 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
     return jsonResponse(
       {
         objective: decision.objective,
-        answer: decision.answer,
+        answer,
         confidence: Math.max(0, Math.min(1, decision.confidence)),
         uiAction: toUiAction(decision),
         steps,
@@ -242,7 +364,10 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
           provider: "cloudflare-workers-ai",
           model,
           toolsConnected: memoryLoaded ? 1 : 0,
+          authenticated: Boolean(identity),
           memoryLoaded,
+          memoryRequested,
+          memorySaved,
         },
       },
       200,
@@ -260,14 +385,7 @@ async function handleRun(request: Request, env: Env): Promise<Response> {
   }
 }
 
-const MEMORY_KINDS = new Set<MemoryKind>([
-  "decision",
-  "preference",
-  "fact",
-  "commitment",
-  "procedure",
-  "note",
-]);
+const MEMORY_KINDS = new Set<MemoryKind>(MEMORY_KIND_VALUES);
 
 async function handleMemoryWrite(request: Request, env: Env): Promise<Response> {
   const identity = await requireIdentity(request, env);
@@ -279,6 +397,7 @@ async function handleMemoryWrite(request: Request, env: Env): Promise<Response> 
     content?: unknown;
     importance?: unknown;
     projectId?: unknown;
+    projectName?: unknown;
   };
 
   try {
@@ -306,6 +425,7 @@ async function handleMemoryWrite(request: Request, env: Env): Promise<Response> 
         content: body.content.trim(),
         importance: typeof body.importance === "number" ? body.importance : undefined,
         projectId: typeof body.projectId === "string" ? body.projectId : null,
+        projectName: typeof body.projectName === "string" ? body.projectName : null,
       },
       identity,
       env,
@@ -315,6 +435,23 @@ async function handleMemoryWrite(request: Request, env: Env): Promise<Response> 
     console.error("Jarvis memory write failure", error);
     return jsonResponse({ error: "MEMORY_WRITE_FAILED" }, 502, request, env);
   }
+}
+
+async function handleLogin(request: Request, env: Env): Promise<Response> {
+  let body: { password?: unknown };
+  try {
+    body = (await request.json()) as { password?: unknown };
+  } catch {
+    return jsonResponse({ error: "INVALID_JSON" }, 400, request, env);
+  }
+
+  if (typeof body.password !== "string" || body.password.length < 8 || body.password.length > 256) {
+    return jsonResponse({ error: "INVALID_PASSWORD" }, 400, request, env);
+  }
+
+  const result = await login(request, env, body.password);
+  if (!result.ok) return jsonResponse({ error: result.code }, result.status, request, env);
+  return jsonResponse({ token: result.token, expiresAt: result.expiresAt }, 200, request, env);
 }
 
 export default {
@@ -333,10 +470,11 @@ export default {
         {
           status: "ok",
           service: "jarvis-core",
-          version: "0.2.0",
+          version: "0.3.0",
           ai: true,
+          database: dbConfigured(env) ? "bound" : "pending",
           identityConfigured: authConfigured(env),
-          memory: authConfigured(env) ? "configured" : "pending",
+          memory: authConfigured(env) ? "locked-ready" : "awaiting-owner-secret",
           toolsConnected: authConfigured(env) ? 1 : 0,
         },
         200,
@@ -345,12 +483,46 @@ export default {
       );
     }
 
+    if (request.method === "POST" && url.pathname === "/v1/auth/login") {
+      return handleLogin(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/auth/status") {
+      if (!authConfigured(env)) {
+        return jsonResponse({ configured: false, authenticated: false }, 200, request, env);
+      }
+      const auth = await authenticate(request, env);
+      return jsonResponse(
+        { configured: true, authenticated: auth.ok },
+        auth.ok ? 200 : 401,
+        request,
+        env,
+      );
+    }
+
+    if (request.method === "POST" && url.pathname === "/v1/auth/logout") {
+      await logout(request, env);
+      return jsonResponse({ ok: true }, 200, request, env);
+    }
+
     if (request.method === "POST" && url.pathname === "/v1/run") {
       return handleRun(request, env);
     }
 
     if (request.method === "POST" && url.pathname === "/v1/memory") {
       return handleMemoryWrite(request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/projects") {
+      const identity = await requireIdentity(request, env);
+      if (identity instanceof Response) return identity;
+      return jsonResponse({ projects: await listProjects(identity, env) }, 200, request, env);
+    }
+
+    if (request.method === "GET" && url.pathname === "/v1/memories") {
+      const identity = await requireIdentity(request, env);
+      if (identity instanceof Response) return identity;
+      return jsonResponse({ memories: await listRecentMemories(identity, env) }, 200, request, env);
     }
 
     return jsonResponse({ error: "NOT_FOUND" }, 404, request, env);
