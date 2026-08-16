@@ -1,3 +1,9 @@
+import {
+  JARVIS_CORE_URL,
+  clearJarvisSessionToken,
+  getJarvisSessionToken,
+} from "@/lib/jarvisSession";
+
 export type WorkspaceSection = "projects" | "files" | "ideas" | "research";
 
 export type JarvisUiAction =
@@ -11,6 +17,13 @@ export interface JarvisPlanStep {
   status: "planned" | "done" | "blocked";
 }
 
+export interface JarvisCoreMeta {
+  authenticated?: boolean;
+  memoryLoaded?: boolean;
+  memoryRequested?: boolean;
+  memorySaved?: boolean;
+}
+
 export interface JarvisCoreResult {
   runId: string;
   mode: "local" | "remote";
@@ -20,6 +33,7 @@ export interface JarvisCoreResult {
   uiAction: JarvisUiAction;
   steps: JarvisPlanStep[];
   needsRemoteCore: boolean;
+  core?: JarvisCoreMeta;
 }
 
 interface RemoteCoreResponse {
@@ -28,12 +42,15 @@ interface RemoteCoreResponse {
   confidence?: number;
   uiAction?: JarvisUiAction;
   steps?: JarvisPlanStep[];
+  core?: JarvisCoreMeta;
 }
 
-const DEFAULT_REMOTE_CORE_URL =
-  "https://ultron-by-sagar-builds.recouvr-saas.workers.dev";
-const REMOTE_CORE_URL =
-  process.env.NEXT_PUBLIC_JARVIS_CORE_URL?.trim() || DEFAULT_REMOTE_CORE_URL;
+export class JarvisAuthRequiredError extends Error {
+  constructor() {
+    super("JARVIS_AUTH_REQUIRED");
+    this.name = "JarvisAuthRequiredError";
+  }
+}
 
 function normalize(input: string): string {
   return input
@@ -95,13 +112,13 @@ function localPlan(command: string): JarvisCoreResult {
       section: "projects",
       words: ["projet", "projets", "travaux", "priorites", "priorite"],
       objective: "Explorer les projets et priorités",
-      answer: "J’ouvre l’espace Projets. Le prochain Core y injectera ensuite tes données réelles.",
+      answer: "J’ouvre l’espace Projets. Le Core distant pourra y injecter tes données réelles.",
     },
     {
       section: "files",
       words: ["fichier", "fichiers", "document", "documents", "dossier", "dossiers"],
       objective: "Explorer les fichiers et documents",
-      answer: "J’ouvre l’espace Fichiers. La connexion aux sources réelles sera branchée au Core distant.",
+      answer: "J’ouvre l’espace Fichiers. Les sources réelles seront utilisées lorsqu’elles seront connectées au Core.",
     },
     {
       section: "ideas",
@@ -149,7 +166,7 @@ function localPlan(command: string): JarvisCoreResult {
       mode: "local",
       objective: "Préparer les priorités de la journée",
       answer:
-        "J’ai compris que tu veux un briefing de ta journée. Pour le faire correctement, le prochain branchement doit me donner accès à l’agenda, aux tâches et à la mémoire de projets.",
+        "J’ai compris que tu veux un briefing de ta journée. Pour le faire correctement, il faut encore connecter l’agenda et les tâches au Core.",
       confidence: 0.91,
       uiAction: { type: "open-workspace", section: "projects" },
       needsRemoteCore: true,
@@ -157,7 +174,7 @@ function localPlan(command: string): JarvisCoreResult {
         { id: "understand", label: "Comprendre l’objectif", status: "done" },
         { id: "calendar", label: "Consulter l’agenda", status: "blocked" },
         { id: "tasks", label: "Consulter les tâches", status: "blocked" },
-        { id: "memory", label: "Récupérer les projets actifs", status: "blocked" },
+        { id: "memory", label: "Récupérer les projets actifs", status: "planned" },
         { id: "brief", label: "Construire le briefing", status: "planned" },
       ],
     };
@@ -168,7 +185,7 @@ function localPlan(command: string): JarvisCoreResult {
     mode: "local",
     objective: "Comprendre et exécuter la demande",
     answer:
-      "J’ai reçu la demande. Le noyau local ne doit pas inventer une réponse : cette requête sera confiée au moteur IA du Jarvis Core dès qu’il sera connecté.",
+      "J’ai reçu la demande. Le noyau local ne doit pas inventer une réponse : cette requête nécessite le moteur IA du Jarvis Core.",
     confidence: 0.55,
     uiAction: { type: "none" },
     needsRemoteCore: true,
@@ -184,17 +201,24 @@ async function runRemote(
   command: string,
   signal?: AbortSignal,
 ): Promise<JarvisCoreResult | null> {
-  if (!REMOTE_CORE_URL) return null;
-
   try {
-    const response = await fetch(`${REMOTE_CORE_URL.replace(/\/$/, "")}/v1/run`, {
+    const token = getJarvisSessionToken();
+    const headers: Record<string, string> = { "content-type": "application/json" };
+    if (token) headers.authorization = `Bearer ${token}`;
+
+    const response = await fetch(`${JARVIS_CORE_URL.replace(/\/$/, "")}/v1/run`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
+      headers,
       body: JSON.stringify({ command, client: "jarvis-web-v1" }),
       signal,
     });
 
+    if (response.status === 401) {
+      clearJarvisSessionToken();
+      throw new JarvisAuthRequiredError();
+    }
     if (!response.ok) return null;
+
     const payload = (await response.json()) as RemoteCoreResponse;
     if (!payload.answer || !payload.objective) return null;
 
@@ -207,8 +231,10 @@ async function runRemote(
       uiAction: payload.uiAction ?? { type: "none" },
       steps: payload.steps ?? [],
       needsRemoteCore: false,
+      core: payload.core,
     };
   } catch (error) {
+    if (error instanceof JarvisAuthRequiredError) throw error;
     if (error instanceof DOMException && error.name === "AbortError") throw error;
     return null;
   }
