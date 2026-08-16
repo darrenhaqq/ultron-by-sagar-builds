@@ -12,6 +12,7 @@ import {
   type JarvisCoreResult,
   type WorkspaceSection,
 } from "@/lib/jarvisCore";
+import coreStyles from "@/components/JarvisCore.module.css";
 
 type ImmersiveState = "idle" | "loading" | "ready" | "error";
 type CoreState = "idle" | "running" | "done" | "error";
@@ -207,7 +208,10 @@ export default function JarvisShell() {
           </div>
         ) : (
           <div className="conversation-home">
-            <div className={`light-orb${coreState === "running" ? " core-running" : ""}`} aria-hidden="true">
+            <div
+              className={`light-orb${coreState === "running" ? ` ${coreStyles.runningOrb}` : ""}`}
+              aria-hidden="true"
+            >
               <span />
             </div>
             <h1>Que dois-je faire pour toi&nbsp;?</h1>
@@ -226,7 +230,7 @@ export default function JarvisShell() {
       </section>
 
       {coreState === "running" ? (
-        <div className="core-card core-card-running" role="status">
+        <div className={`${coreStyles.card} ${coreStyles.running}`} role="status">
           <div>
             <span>JARVIS CORE</span>
             <strong>Analyse de l’objectif et choix de l’action…</strong>
@@ -234,13 +238,13 @@ export default function JarvisShell() {
           <button type="button" onClick={stopCore}>STOP</button>
         </div>
       ) : coreResult ? (
-        <div className="core-card" role="status">
-          <div className="core-card-copy">
+        <div className={coreStyles.card} role="status">
+          <div className={coreStyles.copy}>
             <span>{coreResult.mode === "remote" ? "CORE IA" : "CORE LOCAL"}</span>
             <strong>{coreResult.objective}</strong>
             <small>{coreResult.answer}</small>
           </div>
-          <div className="core-plan" aria-label="Plan Jarvis">
+          <div className={coreStyles.plan} aria-label="Plan Jarvis">
             {coreResult.steps.map((step) => (
               <span key={step.id} data-status={step.status} title={step.label}>
                 {step.status === "done" ? "✓" : step.status === "blocked" ? "!" : "·"}
@@ -249,7 +253,7 @@ export default function JarvisShell() {
           </div>
         </div>
       ) : coreState === "error" ? (
-        <div className="core-card core-card-error" role="alert">
+        <div className={`${coreStyles.card} ${coreStyles.error}`} role="alert">
           {coreError}
         </div>
       ) : null}
