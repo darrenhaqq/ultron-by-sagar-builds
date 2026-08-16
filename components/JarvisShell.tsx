@@ -4,18 +4,27 @@ import {
   type ComponentType,
   type FormEvent,
   useCallback,
+  useEffect,
   useRef,
   useState,
 } from "react";
 import {
+  JarvisAuthRequiredError,
   runJarvisCore,
   type JarvisCoreResult,
   type WorkspaceSection,
 } from "@/lib/jarvisCore";
+import {
+  getJarvisSessionStatus,
+  loginJarvis,
+  logoutJarvis,
+} from "@/lib/jarvisSession";
 import coreStyles from "@/components/JarvisCore.module.css";
+import authStyles from "@/components/JarvisAuth.module.css";
 
 type ImmersiveState = "idle" | "loading" | "ready" | "error";
 type CoreState = "idle" | "running" | "done" | "error";
+type MemoryAccessState = "checking" | "inactive" | "locked" | "unlocked";
 
 const WORKSPACE_ITEMS: Array<{
   id: WorkspaceSection;
@@ -42,6 +51,7 @@ function supportsWebGL(): boolean {
 
 export default function JarvisShell() {
   const abortRef = useRef<AbortController | null>(null);
+  const pendingCommandRef = useRef<string | null>(null);
   const [Immersive, setImmersive] = useState<ComponentType | null>(null);
   const [immersiveState, setImmersiveState] = useState<ImmersiveState>("idle");
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
@@ -51,6 +61,24 @@ export default function JarvisShell() {
   const [coreState, setCoreState] = useState<CoreState>("idle");
   const [coreResult, setCoreResult] = useState<JarvisCoreResult | null>(null);
   const [coreError, setCoreError] = useState<string | null>(null);
+  const [memoryAccess, setMemoryAccess] = useState<MemoryAccessState>("checking");
+  const [authOpen, setAuthOpen] = useState(false);
+  const [password, setPassword] = useState("");
+  const [authBusy, setAuthBusy] = useState(false);
+  const [authError, setAuthError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    void getJarvisSessionStatus().then((status) => {
+      if (!mounted) return;
+      if (!status.configured) setMemoryAccess("inactive");
+      else if (status.authenticated) setMemoryAccess("unlocked");
+      else setMemoryAccess("locked");
+    });
+    return () => {
+      mounted = false;
+    };
+  }, []);
 
   const openImmersive = useCallback(async () => {
     if (immersiveState === "loading" || immersiveState === "ready") return;
@@ -92,6 +120,7 @@ export default function JarvisShell() {
         if (controller.signal.aborted) return;
         setCoreResult(result);
         setCoreState("done");
+        if (result.core?.authenticated) setMemoryAccess("unlocked");
 
         if (result.uiAction.type === "open-workspace") {
           setWorkspaceOpen(true);
@@ -101,6 +130,14 @@ export default function JarvisShell() {
         }
       } catch (error) {
         if (error instanceof DOMException && error.name === "AbortError") return;
+        if (error instanceof JarvisAuthRequiredError) {
+          pendingCommandRef.current = trimmed;
+          setMemoryAccess("locked");
+          setCoreState("idle");
+          setAuthError(null);
+          setAuthOpen(true);
+          return;
+        }
         setCoreState("error");
         setCoreError("Le Core n’a pas pu terminer cette demande.");
       } finally {
@@ -128,6 +165,52 @@ export default function JarvisShell() {
     setCoreError(null);
   }, []);
 
+  const submitLogin = useCallback(
+    async (event: FormEvent<HTMLFormElement>) => {
+      event.preventDefault();
+      if (authBusy || password.length < 8) return;
+      setAuthBusy(true);
+      setAuthError(null);
+      try {
+        await loginJarvis(password);
+        setPassword("");
+        setMemoryAccess("unlocked");
+        setAuthOpen(false);
+        const pending = pendingCommandRef.current;
+        pendingCommandRef.current = null;
+        if (pending) void executeCommand(pending);
+      } catch (error) {
+        const code = error instanceof Error ? error.message : "AUTH_FAILED";
+        if (code === "IDENTITY_NOT_CONFIGURED") {
+          setMemoryAccess("inactive");
+          setAuthError("La mémoire personnelle n’est pas encore activée côté serveur.");
+        } else if (code === "AUTH_RATE_LIMITED") {
+          setAuthError("Trop de tentatives. Réessaie dans quelques minutes.");
+        } else {
+          setAuthError("Mot de passe incorrect.");
+        }
+      } finally {
+        setAuthBusy(false);
+      }
+    },
+    [authBusy, executeCommand, password],
+  );
+
+  const lockMemory = useCallback(async () => {
+    setAuthBusy(true);
+    await logoutJarvis();
+    setAuthBusy(false);
+    setMemoryAccess("locked");
+    setAuthOpen(false);
+  }, []);
+
+  const memoryLabel =
+    memoryAccess === "unlocked"
+      ? "MÉMOIRE ✓"
+      : memoryAccess === "checking"
+        ? "MÉMOIRE ·"
+        : "MÉMOIRE";
+
   return (
     <main className="jarvis-shell">
       <header className="shell-header">
@@ -138,17 +221,30 @@ export default function JarvisShell() {
             {coreState === "running" ? " CORE ACTIF" : " MODE LÉGER"}
           </div>
         </div>
-        <button
-          type="button"
-          className="shell-action"
-          onClick={() => {
-            setWorkspaceOpen((open) => !open);
-            setWorkspaceSection(null);
-          }}
-          aria-pressed={workspaceOpen}
-        >
-          ESPACE
-        </button>
+        <div className={authStyles.headerActions}>
+          <button
+            type="button"
+            className={`shell-action ${authStyles.memoryButton}`}
+            data-state={memoryAccess}
+            onClick={() => {
+              setAuthError(null);
+              setAuthOpen(true);
+            }}
+          >
+            {memoryLabel}
+          </button>
+          <button
+            type="button"
+            className="shell-action"
+            onClick={() => {
+              setWorkspaceOpen((open) => !open);
+              setWorkspaceSection(null);
+            }}
+            aria-pressed={workspaceOpen}
+          >
+            ESPACE
+          </button>
+        </div>
       </header>
 
       <section className="shell-stage" aria-live="polite">
@@ -216,7 +312,7 @@ export default function JarvisShell() {
             </div>
             <h1>Que dois-je faire pour toi&nbsp;?</h1>
             <p>
-              Donne-moi l’objectif. Le Core choisit maintenant lui-même la première action utile au lieu d’attendre une commande d’interface précise.
+              Donne-moi l’objectif. Le Core choisit lui-même la première action utile et peut maintenant utiliser une mémoire personnelle lorsqu’elle est déverrouillée.
             </p>
 
             {lastCommand && !coreResult && coreState !== "running" ? (
@@ -243,6 +339,9 @@ export default function JarvisShell() {
             <span>{coreResult.mode === "remote" ? "CORE IA" : "CORE LOCAL"}</span>
             <strong>{coreResult.objective}</strong>
             <small>{coreResult.answer}</small>
+            {coreResult.core?.memorySaved ? (
+              <small className={authStyles.saved}>✓ MÉMOIRE ENREGISTRÉE</small>
+            ) : null}
           </div>
           <div className={coreStyles.plan} aria-label="Plan Jarvis">
             {coreResult.steps.map((step) => (
@@ -263,7 +362,7 @@ export default function JarvisShell() {
           <input
             value={command}
             onChange={(event) => setCommand(event.target.value)}
-            placeholder="Ex. Jarvis, montre-moi mes projets…"
+            placeholder="Ex. Jarvis, retiens que…"
             aria-label="Commande Jarvis"
             disabled={coreState === "running"}
           />
@@ -298,6 +397,82 @@ export default function JarvisShell() {
             FERMER
           </button>
         </section>
+      ) : null}
+
+      {authOpen ? (
+        <div className={authStyles.backdrop} role="presentation">
+          <section className={authStyles.panel} role="dialog" aria-modal="true" aria-label="Mémoire Jarvis">
+            <div className={authStyles.panelHeader}>
+              <div>
+                <div className={authStyles.kicker}>MÉMOIRE PERSONNELLE</div>
+                <h2 className={authStyles.title}>
+                  {memoryAccess === "unlocked" ? "Mémoire active" : "Déverrouiller Jarvis"}
+                </h2>
+              </div>
+              <button
+                type="button"
+                className={authStyles.close}
+                onClick={() => {
+                  pendingCommandRef.current = null;
+                  setAuthOpen(false);
+                }}
+                aria-label="Fermer"
+              >
+                ×
+              </button>
+            </div>
+
+            {memoryAccess === "unlocked" ? (
+              <>
+                <p className={authStyles.copy}>
+                  Cette session peut utiliser les projets, décisions et informations que tu demandes explicitement à Jarvis de retenir.
+                </p>
+                <div className={authStyles.statusLine}>
+                  <span className={authStyles.statusDot} aria-hidden="true" />
+                  Session personnelle déverrouillée
+                </div>
+                <button
+                  type="button"
+                  className={authStyles.secondary}
+                  onClick={() => void lockMemory()}
+                  disabled={authBusy}
+                >
+                  VERROUILLER LA MÉMOIRE
+                </button>
+              </>
+            ) : memoryAccess === "inactive" ? (
+              <p className={authStyles.copy}>
+                La base mémoire est prête dans l’application. Il reste à définir le secret personnel côté Cloudflare pour l’activer sans exposer tes données.
+              </p>
+            ) : (
+              <>
+                <p className={authStyles.copy}>
+                  Entre ton mot de passe Jarvis. Il restera enregistré uniquement comme session sur cet appareil, pas dans le code public.
+                </p>
+                <form className={authStyles.form} onSubmit={submitLogin}>
+                  <input
+                    className={authStyles.input}
+                    type="password"
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    placeholder="Mot de passe Jarvis"
+                    aria-label="Mot de passe Jarvis"
+                  />
+                  <button
+                    type="submit"
+                    className={authStyles.primary}
+                    disabled={authBusy || password.length < 8}
+                  >
+                    {authBusy ? "VÉRIFICATION…" : "DÉVERROUILLER"}
+                  </button>
+                </form>
+              </>
+            )}
+
+            {authError ? <div className={authStyles.error}>{authError}</div> : null}
+          </section>
+        </div>
       ) : null}
     </main>
   );
